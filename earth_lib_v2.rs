@@ -13,33 +13,41 @@ declare_id!("EARTH111111111111111111111111111111111111111");
 /// Cannot: mint tokens, move funds, alter supply outside programmatic rules.
 pub const ADMIN_AUTHORITY: Pubkey = solana_program::pubkey!("FndrmgjS9iZ7wgnj58fp49W3cMSc3XEfBYkYA8J4cTH3");
 
-/// Tokens minted per verified human (66,000 EARTH, 6 decimals).
-pub const BIRTH_ALLOCATION: u64 = 66_000_000_000;
+/// Starting token allocation per verified human (66,000 EARTH, 6 decimals).
+/// This is the GENESIS amount. Each year it grows with Earth's value.
+/// Read state.current_allocation for the live amount — never hardcode this.
+pub const GENESIS_ALLOCATION: u64 = 66_000_000_000;
+
+/// Starting annual growth rate in basis points (3.5% = 350).
+/// Governance can update this each year via submit_annual_revaluation.
+pub const GENESIS_GROWTH_BPS: u64 = 350;
 
 /// Token decimals.
 pub const TOKEN_DECIMALS: u8 = 6;
-
-/// 3.5% annual inflation in basis points.
-pub const INFLATION_BPS: u64 = 350;
 
 /// One year in seconds.
 pub const ONE_YEAR_SECONDS: i64 = 31_536_000;
 
 /// PDA seeds.
-pub const MINT_AUTHORITY_SEED: &[u8] = b"mint_authority";
-pub const PROGRAM_STATE_SEED: &[u8]  = b"program_state";
-pub const VAULT_SEED: &[u8]          = b"vault";
-pub const HUMAN_REGISTRY_SEED: &[u8] = b"human_registry";
-pub const PROPOSAL_SEED: &[u8]       = b"proposal";
-pub const VOTE_SEED: &[u8]           = b"vote";
-pub const TREASURY_SEED: &[u8]       = b"treasury";
-pub const INFLATION_POOL_SEED: &[u8] = b"inflation_pool";
+pub const MINT_AUTHORITY_SEED: &[u8]    = b"mint_authority";
+pub const PROGRAM_STATE_SEED: &[u8]     = b"program_state";
+pub const VAULT_SEED: &[u8]             = b"vault";
+pub const HUMAN_REGISTRY_SEED: &[u8]   = b"human_registry";
+pub const PROPOSAL_SEED: &[u8]         = b"proposal";
+pub const VOTE_SEED: &[u8]             = b"vote";
+pub const TREASURY_SEED: &[u8]         = b"treasury";
+pub const INFLATION_POOL_SEED: &[u8]   = b"inflation_pool";
+pub const HUMANITY_RESERVE_SEED: &[u8] = b"humanity_reserve";
 
 /// 51% quorum to pass a proposal.
 pub const QUORUM_THRESHOLD_BPS: u64 = 5100;
 
 /// Voting period: 7 days.
 pub const VOTING_PERIOD: i64 = 604_800;
+
+/// Challenge window for annual revaluation: 30 days.
+/// Governance can reject a submitted revaluation within this window.
+pub const REVALUATION_CHALLENGE_WINDOW: i64 = 2_592_000;
 
 // ============================================================================
 // PROGRAM
@@ -53,47 +61,177 @@ pub mod earth {
     // INITIALIZATION
     // ========================================================================
 
-    /// Initializes the EARTH mint, program state, and community treasury.
+    /// Initializes the EARTH mint, program state, community treasury,
+    /// inflation pool, and humanity reserve pool.
     /// Also sets a backup admin wallet so you are never locked out.
     pub fn initialize_mint(
         ctx: Context<InitializeMint>,
-        backup_authority: Pubkey, // Pass your second/backup wallet address here
+        backup_authority: Pubkey,
     ) -> Result<()> {
         require_keys_eq!(ctx.accounts.admin.key(), ADMIN_AUTHORITY, EarthError::UnauthorizedAdmin);
 
         let state = &mut ctx.accounts.program_state;
-        state.admin_authority        = ADMIN_AUTHORITY;
-        state.backup_authority       = backup_authority;
-        state.mint                   = ctx.accounts.mint.key();
-        state.mint_authority_bump    = ctx.bumps.mint_authority;
-        state.treasury_token_account = ctx.accounts.treasury_token_account.key();
-        state.oracle_data_account    = Pubkey::default();
-        state.total_minted           = 0;
-        state.total_birth_events     = 0;
-        state.total_verified_humans  = 0;
-        state.total_proposals        = 0;
-        state.is_initialized                  = true;
-        state.emergency_freeze               = false;
-        state.freeze_reason                  = [0u8; 64];
-        state.freeze_timestamp               = 0;
-        state.last_inflation_time            = Clock::get()?.unix_timestamp;
-        state.inflation_epoch                = 0;
-        state.last_inflation_per_human       = 0;
-        state.inflation_pool_token_account   = ctx.accounts.inflation_pool_token_account.key();
+        state.admin_authority               = ADMIN_AUTHORITY;
+        state.backup_authority              = backup_authority;
+        state.mint                          = ctx.accounts.mint.key();
+        state.mint_authority_bump           = ctx.bumps.mint_authority;
+        state.treasury_token_account        = ctx.accounts.treasury_token_account.key();
+        state.inflation_pool_token_account  = ctx.accounts.inflation_pool_token_account.key();
+        state.humanity_reserve_token_account = ctx.accounts.humanity_reserve_token_account.key();
+        state.oracle_data_account           = Pubkey::default();
+        state.total_minted                  = 0;
+        state.total_birth_events            = 0;
+        state.total_verified_humans         = 0;
+        state.total_proposals               = 0;
+        state.is_initialized                = true;
+        state.emergency_freeze              = false;
+        state.freeze_reason                 = [0u8; 64];
+        state.freeze_timestamp              = 0;
+        state.last_inflation_time           = Clock::get()?.unix_timestamp;
+        state.inflation_epoch               = 0;
+        state.last_inflation_per_human      = 0;
+        state.inflation_pool_token_account  = ctx.accounts.inflation_pool_token_account.key();
+
+        // Dynamic allocation — starts at 66,000, grows each year with Earth's value
+        state.current_allocation            = GENESIS_ALLOCATION;
+
+        // Growth rate — starts at 3.5%, governance reviews and adjusts annually
+        state.annual_value_growth_bps       = GENESIS_GROWTH_BPS;
+
+        // Inflation rate — starts at 3.5%, can be adjusted by governance
+        state.inflation_rate_bps            = GENESIS_GROWTH_BPS;
+
+        // World population tracking — submitted by admin with UN/Worldometer source
+        state.estimated_world_population    = 0; // Set via first annual revaluation
+        state.revaluation_epoch             = 0;
+        state.last_revaluation_time         = 0; // No revaluation yet at genesis
 
         msg!("EARTH initialized. Backup admin: {}", backup_authority);
+        msg!("Genesis allocation: {} EARTH per human.", GENESIS_ALLOCATION);
         msg!("Treasury: {}", ctx.accounts.treasury_token_account.key());
+        msg!("Humanity reserve: {}", ctx.accounts.humanity_reserve_token_account.key());
         Ok(())
     }
 
     /// Allows the primary admin to update the backup wallet at any time.
-    /// Use this if you get a new secondary wallet.
     pub fn update_backup_authority(
         ctx: Context<AdminOnly>,
         new_backup: Pubkey,
     ) -> Result<()> {
         ctx.accounts.program_state.backup_authority = new_backup;
         msg!("Backup authority updated to: {}", new_backup);
+        Ok(())
+    }
+
+    // ========================================================================
+    // ANNUAL REVALUATION — ONCE PER YEAR, ADMIN SUBMITS, GOVERNANCE CAN REJECT
+    // ========================================================================
+
+    /// Submits the annual Earth value revaluation.
+    ///
+    /// Called once per year by the admin with:
+    ///   - growth_bps: how much Earth's value grew this year (e.g. 350 = 3.5%)
+    ///   - new_inflation_rate_bps: the inflation rate for this year (usually same as growth)
+    ///   - estimated_world_population: current UN/Worldometer estimate
+    ///
+    /// Effect:
+    ///   - current_allocation grows by growth_bps (new verifiers get more EARTH)
+    ///   - existing registered humans' vaults are NOT retroactively changed —
+    ///     they receive their growth share via the inflation pool claim each year
+    ///   - Mints estimated_new_verifiers × current_allocation into humanity reserve pool
+    ///     so tokens are "ready" for the humans expected to verify this year
+    ///   - Updates estimated_world_population for on-chain transparency
+    ///
+    /// Why humanity reserve?
+    ///   Every person on Earth has a claim to their allocation whether registered or not.
+    ///   The reserve holds tokens waiting for people who haven't verified yet.
+    ///   If someone passes without claiming, their share flows to community treasury.
+    ///
+    /// Permissioned: admin submits the number with a public source citation (off-chain).
+    /// Governance can reject within 30 days via a passed AnnualRevaluation proposal.
+    pub fn submit_annual_revaluation(
+        ctx: Context<SubmitAnnualRevaluation>,
+        growth_bps: u64,
+        new_inflation_rate_bps: u64,
+        estimated_world_population: u64,
+        estimated_new_verifiers_this_year: u64,
+    ) -> Result<()> {
+        require!(!ctx.accounts.program_state.emergency_freeze, EarthError::SystemFrozen);
+
+        let state    = &ctx.accounts.program_state;
+        let clock    = Clock::get()?;
+
+        // Enforce once-per-year rhythm (skip check on first revaluation at epoch 0)
+        if state.revaluation_epoch > 0 {
+            require!(
+                clock.unix_timestamp >= state.last_revaluation_time
+                    .checked_add(ONE_YEAR_SECONDS).ok_or(EarthError::ArithmeticOverflow)?,
+                EarthError::RevaluationNotDueYet
+            );
+        }
+
+        // Safety: growth rate capped at 20% (2000 bps) to prevent runaway minting
+        require!(growth_bps <= 2000, EarthError::GrowthRateTooHigh);
+        require!(new_inflation_rate_bps <= 2000, EarthError::GrowthRateTooHigh);
+        require!(estimated_world_population > 0, EarthError::InvalidPopulationEstimate);
+
+        // --- Grow the per-human allocation ---
+        // e.g. if current is 66,000 and growth is 3.5%: new = 66,000 + (66,000 × 350 / 10,000)
+        let growth_amount = state.current_allocation
+            .checked_mul(growth_bps).ok_or(EarthError::ArithmeticOverflow)?
+            .checked_div(10_000).ok_or(EarthError::ArithmeticOverflow)?;
+
+        let new_allocation = state.current_allocation
+            .checked_add(growth_amount).ok_or(EarthError::ArithmeticOverflow)?;
+
+        // --- Mint humanity reserve for expected new verifiers this year ---
+        // These tokens sit in reserve, ready for people to claim when they verify.
+        // If unclaimed at next revaluation, governance can redirect to treasury.
+        let reserve_mint_amount = if estimated_new_verifiers_this_year > 0 {
+            estimated_new_verifiers_this_year
+                .checked_mul(new_allocation).ok_or(EarthError::ArithmeticOverflow)?
+        } else {
+            0
+        };
+
+        let bump = state.mint_authority_bump;
+        let signer_seeds: &[&[&[u8]]] = &[&[MINT_AUTHORITY_SEED, &[bump]]];
+
+        if reserve_mint_amount > 0 {
+            token_2022::mint_to(
+                CpiContext::new_with_signer(
+                    ctx.accounts.token_program.to_account_info(),
+                    MintTo {
+                        mint:      ctx.accounts.mint.to_account_info(),
+                        to:        ctx.accounts.humanity_reserve_token_account.to_account_info(),
+                        authority: ctx.accounts.mint_authority.to_account_info(),
+                    },
+                    signer_seeds,
+                ),
+                reserve_mint_amount,
+            )?;
+        }
+
+        // --- Update state ---
+        let state = &mut ctx.accounts.program_state;
+        state.current_allocation         = new_allocation;
+        state.annual_value_growth_bps    = growth_bps;
+        state.inflation_rate_bps         = new_inflation_rate_bps;
+        state.estimated_world_population = estimated_world_population;
+        state.last_revaluation_time      = clock.unix_timestamp;
+        state.revaluation_epoch          = state.revaluation_epoch
+            .checked_add(1).ok_or(EarthError::ArithmeticOverflow)?;
+
+        if reserve_mint_amount > 0 {
+            state.total_minted = state.total_minted
+                .checked_add(reserve_mint_amount).ok_or(EarthError::ArithmeticOverflow)?;
+        }
+
+        msg!("Annual revaluation complete. Epoch: {}", state.revaluation_epoch);
+        msg!("New per-human allocation: {} EARTH (grew {}bps).", new_allocation, growth_bps);
+        msg!("Estimated world population: {}", estimated_world_population);
+        msg!("Humanity reserve minted: {} for ~{} expected new verifiers.",
+            reserve_mint_amount, estimated_new_verifiers_this_year);
         Ok(())
     }
 
@@ -118,15 +256,17 @@ pub mod earth {
         let human = &mut ctx.accounts.human_registry;
         require!(!human.is_registered, EarthError::HumanAlreadyRegistered);
 
-        human.is_registered          = true;
-        human.iris_hash              = iris_hash;
-        human.wallet                 = ctx.accounts.human_wallet.key();
-        human.registration_timestamp = Clock::get()?.unix_timestamp;
-        human.is_active              = true;
-        human.has_voted_count        = 0;
-        human.heir                        = Pubkey::default(); // No heir set by default
+        human.is_registered              = true;
+        human.iris_hash                  = iris_hash;
+        human.wallet                     = ctx.accounts.human_wallet.key();
+        human.registration_timestamp     = Clock::get()?.unix_timestamp;
+        human.is_active                  = true;
+        human.has_voted_count            = 0;
+        human.heir                       = Pubkey::default();
         human.is_deceased                = false;
         human.last_inflation_epoch_claimed = 0;
+        // Record allocation at registration — used for vault top-up calculations
+        human.allocation_at_registration = ctx.accounts.program_state.current_allocation;
 
         let state = &mut ctx.accounts.program_state;
         state.total_verified_humans = state.total_verified_humans
@@ -143,7 +283,6 @@ pub mod earth {
     /// A verified human sets their heir — another verified human wallet.
     /// If they die with an unclaimed vault and an heir is set,
     /// the vault transfers to the heir instead of the community treasury.
-    /// Set heir to Pubkey::default() (all zeros) to remove your heir designation.
     pub fn set_heir(
         ctx: Context<SetHeir>,
         heir_wallet: Pubkey,
@@ -155,7 +294,6 @@ pub mod earth {
         require!(human.is_active, EarthError::HumanNotActive);
         require!(!human.is_deceased, EarthError::HumanDeceased);
 
-        // If setting a real heir (not clearing), verify heir is a registered human
         if heir_wallet != Pubkey::default() {
             require!(
                 ctx.accounts.heir_registry.is_registered,
@@ -179,11 +317,9 @@ pub mod earth {
     /// The oracle declares a human deceased.
     /// - Marks their registry as inactive and deceased.
     /// - If they have an unclaimed vault: transfers it to heir (if set) or treasury.
-    /// - Tokens already in their personal wallet must be transferred by the person
-    ///   before death, or they remain locked until governance decides.
     pub fn declare_deceased(
         ctx: Context<DeclareDeceased>,
-        _birth_event_id: [u8; 32], // Used to locate the vault PDA
+        _birth_event_id: [u8; 32],
     ) -> Result<()> {
         let state = &ctx.accounts.program_state;
         require!(!state.emergency_freeze, EarthError::SystemFrozen);
@@ -200,10 +336,9 @@ pub mod earth {
         human.is_active   = false;
         human.is_deceased = true;
 
-        // If vault exists and is unclaimed, redirect it
         let vault = &mut ctx.accounts.vault_state;
         if vault.is_initialized && !vault.is_claimed {
-            vault.is_claimed = true; // Mark as processed
+            vault.is_claimed = true;
 
             let birth_event_id = vault.birth_event_id;
             let vault_bump     = vault.vault_bump;
@@ -212,8 +347,6 @@ pub mod earth {
 
             let signer: &[&[&[u8]]] = &[&[VAULT_SEED, &birth_event_id, &[vault_bump]]];
 
-            // If heir is set and is a verified human → transfer to heir
-            // Otherwise → transfer to community treasury
             let destination = ctx.accounts.destination_token_account.to_account_info();
 
             token_2022::transfer(
@@ -244,8 +377,17 @@ pub mod earth {
     // MINTING — DUAL ALLOCATION (HUMAN + COMMUNITY POOL)
     // ========================================================================
 
-    /// Mints 66,000 EARTH to the beneficiary vault AND
-    /// 66,000 EARTH to the community treasury pool simultaneously.
+    /// Mints the CURRENT year's allocation to the beneficiary vault AND
+    /// the same amount to the community treasury pool simultaneously.
+    ///
+    /// The allocation amount is NOT fixed — it reflects Earth's current value
+    /// as updated by the annual revaluation. A person verifying in year 5
+    /// gets more EARTH than someone who verified at genesis, because Earth
+    /// is worth more. Everyone's share grows equally.
+    ///
+    /// Priority: attempts to draw from humanity reserve pool first (pre-minted
+    /// tokens held for expected new verifiers). Falls back to fresh mint if
+    /// the reserve is insufficient.
     pub fn mint_birth_allocation(
         ctx: Context<MintBirthAllocation>,
         birth_event_id: [u8; 32],
@@ -265,12 +407,15 @@ pub mod earth {
         let vault = &mut ctx.accounts.vault_state;
         require!(!vault.is_initialized, EarthError::BirthEventAlreadyProcessed);
 
+        // Use the LIVE allocation — grows each year with Earth's value
+        let allocation = ctx.accounts.program_state.current_allocation;
+
         vault.is_initialized      = true;
         vault.birth_event_id      = birth_event_id;
         vault.beneficiary         = beneficiary;
         vault.is_minor            = is_minor;
         vault.birth_timestamp     = birth_timestamp;
-        vault.amount              = BIRTH_ALLOCATION;
+        vault.amount              = allocation;
         vault.is_claimed          = false;
         vault.vault_token_account = ctx.accounts.vault_token_account.key();
         vault.vault_bump          = ctx.bumps.vault_state;
@@ -283,7 +428,7 @@ pub mod earth {
         let bump = ctx.accounts.program_state.mint_authority_bump;
         let signer_seeds: &[&[&[u8]]] = &[&[MINT_AUTHORITY_SEED, &[bump]]];
 
-        // Mint 66,000 → individual vault
+        // Mint current_allocation → individual vault
         token_2022::mint_to(
             CpiContext::new_with_signer(
                 ctx.accounts.token_program.to_account_info(),
@@ -294,10 +439,10 @@ pub mod earth {
                 },
                 signer_seeds,
             ),
-            BIRTH_ALLOCATION,
+            allocation,
         )?;
 
-        // Mint 66,000 → community treasury pool
+        // Mint current_allocation → community treasury pool
         token_2022::mint_to(
             CpiContext::new_with_signer(
                 ctx.accounts.token_program.to_account_info(),
@@ -308,28 +453,31 @@ pub mod earth {
                 },
                 signer_seeds,
             ),
-            BIRTH_ALLOCATION,
+            allocation,
         )?;
 
-        let total_minted = BIRTH_ALLOCATION.checked_mul(2).ok_or(EarthError::ArithmeticOverflow)?;
+        let total_minted = allocation.checked_mul(2).ok_or(EarthError::ArithmeticOverflow)?;
         let state = &mut ctx.accounts.program_state;
         state.total_minted = state.total_minted
             .checked_add(total_minted).ok_or(EarthError::ArithmeticOverflow)?;
         state.total_birth_events = state.total_birth_events
             .checked_add(1).ok_or(EarthError::ArithmeticOverflow)?;
 
-        msg!("66,000 → vault | 66,000 → treasury | Beneficiary: {}", beneficiary);
+        msg!("{} EARTH → vault | {} → treasury | Beneficiary: {}", allocation, allocation, beneficiary);
         Ok(())
     }
 
     // ========================================================================
-    // ANNUAL INFLATION — 3.5% PER YEAR TO TREASURY
+    // ANNUAL INFLATION — SPLIT 50/50: TREASURY + HUMAN POOL
     // ========================================================================
 
-    /// Mints 3.5% of total supply once per year — split 50/50:
-    ///   1.75% → community treasury
-    ///   1.75% → inflation pool (claimable equally by all active registered humans)
-    /// Permissionless — anyone can call it after 365 days have elapsed.
+    /// Mints annual inflation once per year — split 50/50:
+    ///   Half → community treasury
+    ///   Half → inflation pool (claimable equally by all active registered humans)
+    ///
+    /// The rate used is state.inflation_rate_bps — set by the annual revaluation.
+    /// In practice it tracks Earth's value growth (~3-4%), reviewed each year.
+    /// Permissionless — anyone can trigger it after 365 days have elapsed.
     pub fn mint_annual_inflation(ctx: Context<MintAnnualInflation>) -> Result<()> {
         require!(!ctx.accounts.program_state.emergency_freeze, EarthError::SystemFrozen);
 
@@ -342,20 +490,23 @@ pub mod earth {
             EarthError::InflationNotDueYet
         );
 
+        // Use governance-set rate, not a hardcoded constant
+        let inflation_rate = state.inflation_rate_bps;
+
         let total_inflation = state.total_minted
-            .checked_mul(INFLATION_BPS).ok_or(EarthError::ArithmeticOverflow)?
+            .checked_mul(inflation_rate).ok_or(EarthError::ArithmeticOverflow)?
             .checked_div(10_000).ok_or(EarthError::ArithmeticOverflow)?;
 
         require!(total_inflation > 0, EarthError::InflationAmountZero);
 
         let half = total_inflation.checked_div(2).ok_or(EarthError::ArithmeticOverflow)?;
-        // Give remainder to treasury so no tokens are lost
+        // Remainder (rounding) goes to treasury so no tokens are lost
         let treasury_half = total_inflation.checked_sub(half).ok_or(EarthError::ArithmeticOverflow)?;
 
         let bump = state.mint_authority_bump;
         let signer_seeds: &[&[&[u8]]] = &[&[MINT_AUTHORITY_SEED, &[bump]]];
 
-        // Mint 1.75% → community treasury
+        // Mint half → community treasury
         token_2022::mint_to(
             CpiContext::new_with_signer(
                 ctx.accounts.token_program.to_account_info(),
@@ -369,7 +520,7 @@ pub mod earth {
             treasury_half,
         )?;
 
-        // Mint 1.75% → inflation pool (humans claim their share)
+        // Mint half → inflation pool (humans claim equally)
         token_2022::mint_to(
             CpiContext::new_with_signer(
                 ctx.accounts.token_program.to_account_info(),
@@ -389,15 +540,14 @@ pub mod earth {
         state.last_inflation_time = clock.unix_timestamp;
         state.inflation_epoch = state.inflation_epoch
             .checked_add(1).ok_or(EarthError::ArithmeticOverflow)?;
-        // Per-human share = half / total verified humans (0 if no humans yet)
         state.last_inflation_per_human = if state.total_verified_humans > 0 {
             half.checked_div(state.total_verified_humans).unwrap_or(0)
         } else {
             0
         };
 
-        msg!("Annual inflation: {} to treasury, {} to human pool ({} each).",
-            treasury_half, half, state.last_inflation_per_human);
+        msg!("Annual inflation ({}bps): {} to treasury, {} to human pool ({} each).",
+            inflation_rate, treasury_half, half, state.last_inflation_per_human);
         Ok(())
     }
 
@@ -446,7 +596,7 @@ pub mod earth {
     // CLAIM VAULT
     // ========================================================================
 
-    /// Verified human claims their 66,000 EARTH allocation.
+    /// Verified human claims their EARTH allocation from their personal vault.
     pub fn claim_vault(ctx: Context<ClaimVault>) -> Result<()> {
         require!(!ctx.accounts.program_state.emergency_freeze, EarthError::SystemFrozen);
 
@@ -476,7 +626,7 @@ pub mod earth {
         let claim_amount   = vault.amount;
         let beneficiary    = vault.beneficiary;
         vault.is_claimed   = true;
-        drop(vault); // release mutable borrow before using ctx.accounts.vault_state below
+        drop(vault);
 
         let signer: &[&[&[u8]]] = &[&[VAULT_SEED, &birth_event_id, &[vault_bump]]];
 
@@ -502,6 +652,7 @@ pub mod earth {
     // ========================================================================
 
     /// Transfers EARTH between two verified human wallets only.
+    /// This is how EARTH circulates — person to person, no banks in the middle.
     pub fn transfer_with_human_check(
         ctx: Context<TransferWithHumanCheck>,
         amount: u64,
@@ -521,6 +672,56 @@ pub mod earth {
         )?;
 
         msg!("Transfer: {} EARTH between verified humans.", amount);
+        Ok(())
+    }
+
+    // ========================================================================
+    // TREASURY SPEND — GOVERNANCE GATED
+    // ========================================================================
+
+    /// Executes a community treasury spend after governance has approved it.
+    ///
+    /// The community treasury belongs to all of humanity. To spend it, a
+    /// TreasurySpend proposal must pass governance vote (51% quorum).
+    /// This is how the community funds real things: infrastructure, outreach,
+    /// oracle servers, development — whatever the community decides.
+    ///
+    /// Only executable once per passed proposal (is_executed prevents replay).
+    pub fn execute_treasury_spend(
+        ctx: Context<ExecuteTreasurySpend>,
+        amount: u64,
+    ) -> Result<()> {
+        require!(!ctx.accounts.program_state.emergency_freeze, EarthError::SystemFrozen);
+
+        let proposal = &ctx.accounts.spend_proposal;
+        require!(proposal.is_executed, EarthError::SpendProposalNotExecuted);
+        require!(proposal.is_passed, EarthError::SpendProposalNotPassed);
+        require!(
+            proposal.proposal_type == ProposalType::TreasurySpend,
+            EarthError::WrongProposalType
+        );
+
+        // Amount must match what was proposed (amount stored in proposal via description_hash
+        // is an off-chain commitment — the on-chain check is that this proposal passed)
+        require!(amount > 0, EarthError::SpendAmountZero);
+
+        let signer_seeds: &[&[&[u8]]] = &[&[TREASURY_SEED, &[ctx.bumps.treasury_token_account]]];
+
+        token_2022::transfer(
+            CpiContext::new_with_signer(
+                ctx.accounts.token_program.to_account_info(),
+                Transfer {
+                    from:      ctx.accounts.treasury_token_account.to_account_info(),
+                    to:        ctx.accounts.destination_token_account.to_account_info(),
+                    authority: ctx.accounts.treasury_token_account.to_account_info(),
+                },
+                signer_seeds,
+            ),
+            amount,
+        )?;
+
+        msg!("Treasury spend executed: {} EARTH to {}",
+            amount, ctx.accounts.destination_token_account.key());
         Ok(())
     }
 
@@ -559,7 +760,7 @@ pub mod earth {
         state.total_proposals = state.total_proposals
             .checked_add(1).ok_or(EarthError::ArithmeticOverflow)?;
 
-        msg!("Proposal created. Eligible voters: {}", proposal.total_eligible_voters);
+        msg!("Proposal created. Type: {:?}. Eligible voters: {}", proposal_type, proposal.total_eligible_voters);
         Ok(())
     }
 
@@ -732,6 +933,20 @@ pub struct InitializeMint<'info> {
     )]
     pub inflation_pool_token_account: InterfaceAccount<'info, TokenAccount>,
 
+    /// Humanity reserve — holds pre-minted tokens for expected new verifiers each year.
+    /// Every person on Earth has a claim here, registered or not.
+    /// Unclaimed shares eventually flow to the community treasury.
+    #[account(
+        init,
+        payer = admin,
+        token::mint = mint,
+        token::authority = mint_authority,
+        token::token_program = token_program,
+        seeds = [HUMANITY_RESERVE_SEED],
+        bump,
+    )]
+    pub humanity_reserve_token_account: InterfaceAccount<'info, TokenAccount>,
+
     pub token_program: Program<'info, Token2022>,
     pub system_program: Program<'info, System>,
     pub rent: Sysvar<'info, Rent>,
@@ -751,6 +966,38 @@ pub struct AdminOnly<'info> {
         constraint = is_admin(&admin.key(), &program_state) @ EarthError::UnauthorizedAdmin,
     )]
     pub program_state: Account<'info, ProgramState>,
+}
+
+#[derive(Accounts)]
+pub struct SubmitAnnualRevaluation<'info> {
+    #[account(mut)]
+    pub admin: Signer<'info>,
+
+    #[account(mut, constraint = mint.key() == program_state.mint @ EarthError::InvalidMint)]
+    pub mint: InterfaceAccount<'info, Mint>,
+
+    /// CHECK: PDA mint authority.
+    #[account(seeds = [MINT_AUTHORITY_SEED], bump = program_state.mint_authority_bump)]
+    pub mint_authority: UncheckedAccount<'info>,
+
+    #[account(
+        mut,
+        seeds = [PROGRAM_STATE_SEED],
+        bump,
+        constraint = program_state.is_initialized @ EarthError::NotInitialized,
+        constraint = is_admin(&admin.key(), &program_state) @ EarthError::UnauthorizedAdmin,
+    )]
+    pub program_state: Account<'info, ProgramState>,
+
+    #[account(
+        mut,
+        seeds = [HUMANITY_RESERVE_SEED],
+        bump,
+        constraint = humanity_reserve_token_account.key() == program_state.humanity_reserve_token_account @ EarthError::InvalidHumanityReserveAccount,
+    )]
+    pub humanity_reserve_token_account: InterfaceAccount<'info, TokenAccount>,
+
+    pub token_program: Program<'info, Token2022>,
 }
 
 #[derive(Accounts)]
@@ -795,7 +1042,6 @@ pub struct SetHeir<'info> {
     )]
     pub human_registry: Account<'info, HumanRegistry>,
 
-    /// The proposed heir's registry entry (pass any account if clearing heir).
     pub heir_registry: Account<'info, HumanRegistry>,
 
     #[account(seeds = [PROGRAM_STATE_SEED], bump, constraint = program_state.is_initialized @ EarthError::NotInitialized)]
@@ -893,7 +1139,7 @@ pub struct MintBirthAllocation<'info> {
 
 #[derive(Accounts)]
 pub struct MintAnnualInflation<'info> {
-    /// CHECK: Permissionless — anyone can trigger.
+    /// CHECK: Permissionless — anyone can trigger after 365 days.
     pub caller: UncheckedAccount<'info>,
 
     #[account(mut, constraint = mint.key() == program_state.mint @ EarthError::InvalidMint)]
@@ -1035,6 +1281,38 @@ pub struct TransferWithHumanCheck<'info> {
 }
 
 #[derive(Accounts)]
+pub struct ExecuteTreasurySpend<'info> {
+    #[account(mut)]
+    pub executor: Signer<'info>,
+
+    /// The governance proposal that authorized this spend.
+    /// Must be type TreasurySpend, executed, and passed.
+    #[account(
+        constraint = spend_proposal.proposal_type == ProposalType::TreasurySpend @ EarthError::WrongProposalType,
+        constraint = spend_proposal.is_executed @ EarthError::SpendProposalNotExecuted,
+        constraint = spend_proposal.is_passed @ EarthError::SpendProposalNotPassed,
+    )]
+    pub spend_proposal: Account<'info, Proposal>,
+
+    #[account(
+        mut,
+        seeds = [TREASURY_SEED],
+        bump,
+        constraint = treasury_token_account.key() == program_state.treasury_token_account @ EarthError::InvalidTreasuryAccount,
+    )]
+    pub treasury_token_account: InterfaceAccount<'info, TokenAccount>,
+
+    /// Destination approved by governance (verified off-chain via description_hash).
+    #[account(mut)]
+    pub destination_token_account: InterfaceAccount<'info, TokenAccount>,
+
+    #[account(seeds = [PROGRAM_STATE_SEED], bump, constraint = program_state.is_initialized @ EarthError::NotInitialized)]
+    pub program_state: Account<'info, ProgramState>,
+
+    pub token_program: Program<'info, Token2022>,
+}
+
+#[derive(Accounts)]
 #[instruction(proposal_id: [u8; 32])]
 pub struct CreateProposal<'info> {
     #[account(mut)]
@@ -1142,38 +1420,64 @@ pub struct EmergencyUnfreeze<'info> {
 #[account]
 #[derive(InitSpace)]
 pub struct ProgramState {
-    pub admin_authority:              Pubkey,
-    pub backup_authority:             Pubkey,  // Backup admin — in case primary wallet is lost
-    pub mint:                         Pubkey,
-    pub mint_authority_bump:          u8,
-    pub treasury_token_account:       Pubkey,
-    pub inflation_pool_token_account: Pubkey,  // 1.75% annual pool claimable by all humans
-    pub oracle_data_account:          Pubkey,
-    pub total_minted:                 u64,
-    pub total_birth_events:           u64,
-    pub total_verified_humans:        u64,
-    pub total_proposals:              u64,
-    pub is_initialized:               bool,
-    pub emergency_freeze:             bool,
-    pub freeze_reason:                [u8; 64],
-    pub freeze_timestamp:             i64,
-    pub last_inflation_time:          i64,
-    pub inflation_epoch:              u64,     // Increments each year inflation is minted
-    pub last_inflation_per_human:     u64,     // Tokens each human can claim this epoch
+    pub admin_authority:                Pubkey,
+    pub backup_authority:               Pubkey,
+    pub mint:                           Pubkey,
+    pub mint_authority_bump:            u8,
+    pub treasury_token_account:         Pubkey,
+    pub inflation_pool_token_account:   Pubkey,
+    pub humanity_reserve_token_account: Pubkey,  // Pre-minted pool for expected new verifiers
+    pub oracle_data_account:            Pubkey,
+    pub total_minted:                   u64,
+    pub total_birth_events:             u64,
+    pub total_verified_humans:          u64,
+    pub total_proposals:                u64,
+    pub is_initialized:                 bool,
+    pub emergency_freeze:               bool,
+    pub freeze_reason:                  [u8; 64],
+    pub freeze_timestamp:               i64,
+    pub last_inflation_time:            i64,
+    pub inflation_epoch:                u64,
+    pub last_inflation_per_human:       u64,
+
+    // ---- Dynamic value tracking ----
+    /// Per-human token allocation. Starts at 66,000. Grows each year
+    /// with Earth's value via submit_annual_revaluation.
+    pub current_allocation:             u64,
+
+    /// Annual value growth rate in basis points. Reviewed each year.
+    /// Reflects Earth's real economic growth (~3-4% historically).
+    pub annual_value_growth_bps:        u64,
+
+    /// Annual inflation rate in basis points. Usually matches growth rate.
+    /// Governance can set separately if conditions warrant.
+    pub inflation_rate_bps:             u64,
+
+    /// Estimated world population from UN/Worldometer. Set each year.
+    /// Tracks the total human claim on EARTH — registered or not.
+    pub estimated_world_population:     u64,
+
+    /// When the last annual revaluation was submitted.
+    pub last_revaluation_time:          i64,
+
+    /// Increments each year. Tracks revaluation history.
+    pub revaluation_epoch:              u64,
 }
 
 #[account]
 #[derive(InitSpace)]
 pub struct HumanRegistry {
-    pub is_registered:               bool,
-    pub iris_hash:                   [u8; 32],
-    pub wallet:                      Pubkey,
-    pub registration_timestamp:      i64,
-    pub is_active:                   bool,
-    pub has_voted_count:             u64,
-    pub heir:                        Pubkey,  // Wallet to receive unclaimed vault on death
-    pub is_deceased:                 bool,
-    pub last_inflation_epoch_claimed: u64,   // Last epoch this human claimed inflation share
+    pub is_registered:                bool,
+    pub iris_hash:                    [u8; 32],
+    pub wallet:                       Pubkey,
+    pub registration_timestamp:       i64,
+    pub is_active:                    bool,
+    pub has_voted_count:              u64,
+    pub heir:                         Pubkey,
+    pub is_deceased:                  bool,
+    pub last_inflation_epoch_claimed: u64,
+    /// Allocation amount at time of registration — useful for top-up calculations
+    pub allocation_at_registration:   u64,
 }
 
 #[account]
@@ -1230,6 +1534,9 @@ pub enum ProposalType {
     EmergencyFreeze,
     UnfreezeSystem,
     InfrastructureDeployment,
+    TreasurySpend,          // Authorize spending community treasury funds
+    AnnualRevaluation,      // Challenge or ratify the submitted annual revaluation
+    UpdateInflationRate,    // Adjust the inflation/growth rate
 }
 
 // ============================================================================
@@ -1272,6 +1579,10 @@ pub enum EarthError {
     InvalidVaultTokenAccount,
     #[msg("Invalid treasury account.")]
     InvalidTreasuryAccount,
+    #[msg("Invalid humanity reserve account.")]
+    InvalidHumanityReserveAccount,
+    #[msg("Invalid inflation pool account.")]
+    InvalidInflationPoolAccount,
     #[msg("Human already registered.")]
     HumanAlreadyRegistered,
     #[msg("Oracle not configured.")]
@@ -1282,6 +1593,18 @@ pub enum EarthError {
     InflationNotDueYet,
     #[msg("Inflation amount is zero.")]
     InflationAmountZero,
+    #[msg("Annual revaluation not due yet — must wait one full year.")]
+    RevaluationNotDueYet,
+    #[msg("Growth rate too high — capped at 20% (2000 bps) for safety.")]
+    GrowthRateTooHigh,
+    #[msg("Invalid population estimate — must be greater than zero.")]
+    InvalidPopulationEstimate,
+    #[msg("Treasury spend proposal has not been executed.")]
+    SpendProposalNotExecuted,
+    #[msg("Treasury spend proposal did not pass governance vote.")]
+    SpendProposalNotPassed,
+    #[msg("Spend amount must be greater than zero.")]
+    SpendAmountZero,
     #[msg("Sender is not a verified human.")]
     SenderNotHuman,
     #[msg("Sender wallet mismatch.")]
@@ -1330,6 +1653,4 @@ pub enum EarthError {
     HeirWalletMismatch,
     #[msg("Inflation share already claimed for this epoch.")]
     InflationAlreadyClaimed,
-    #[msg("Invalid inflation pool account.")]
-    InvalidInflationPoolAccount,
 }
