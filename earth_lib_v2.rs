@@ -33,6 +33,7 @@ pub const HUMAN_REGISTRY_SEED: &[u8] = b"human_registry";
 pub const PROPOSAL_SEED: &[u8]       = b"proposal";
 pub const VOTE_SEED: &[u8]           = b"vote";
 pub const TREASURY_SEED: &[u8]       = b"treasury";
+pub const INFLATION_POOL_SEED: &[u8] = b"inflation_pool";
 
 /// 51% quorum to pass a proposal.
 pub const QUORUM_THRESHOLD_BPS: u64 = 5100;
@@ -71,11 +72,14 @@ pub mod earth {
         state.total_birth_events     = 0;
         state.total_verified_humans  = 0;
         state.total_proposals        = 0;
-        state.is_initialized         = true;
-        state.emergency_freeze       = false;
-        state.freeze_reason          = [0u8; 64];
-        state.freeze_timestamp       = 0;
-        state.last_inflation_time    = Clock::get()?.unix_timestamp;
+        state.is_initialized                  = true;
+        state.emergency_freeze               = false;
+        state.freeze_reason                  = [0u8; 64];
+        state.freeze_timestamp               = 0;
+        state.last_inflation_time            = Clock::get()?.unix_timestamp;
+        state.inflation_epoch                = 0;
+        state.last_inflation_per_human       = 0;
+        state.inflation_pool_token_account   = ctx.accounts.inflation_pool_token_account.key();
 
         msg!("EARTH initialized. Backup admin: {}", backup_authority);
         msg!("Treasury: {}", ctx.accounts.treasury_token_account.key());
@@ -120,8 +124,9 @@ pub mod earth {
         human.registration_timestamp = Clock::get()?.unix_timestamp;
         human.is_active              = true;
         human.has_voted_count        = 0;
-        human.heir                   = Pubkey::default(); // No heir set by default
-        human.is_deceased            = false;
+        human.heir                        = Pubkey::default(); // No heir set by default
+        human.is_deceased                = false;
+        human.last_inflation_epoch_claimed = 0;
 
         let state = &mut ctx.accounts.program_state;
         state.total_verified_humans = state.total_verified_humans
@@ -321,7 +326,9 @@ pub mod earth {
     // ANNUAL INFLATION — 3.5% PER YEAR TO TREASURY
     // ========================================================================
 
-    /// Mints 3.5% of total supply to the community treasury once per year.
+    /// Mints 3.5% of total supply once per year — split 50/50:
+    ///   1.75% → community treasury
+    ///   1.75% → inflation pool (claimable equally by all active registered humans)
     /// Permissionless — anyone can call it after 365 days have elapsed.
     pub fn mint_annual_inflation(ctx: Context<MintAnnualInflation>) -> Result<()> {
         require!(!ctx.accounts.program_state.emergency_freeze, EarthError::SystemFrozen);
@@ -335,15 +342,20 @@ pub mod earth {
             EarthError::InflationNotDueYet
         );
 
-        let inflation_amount = state.total_minted
+        let total_inflation = state.total_minted
             .checked_mul(INFLATION_BPS).ok_or(EarthError::ArithmeticOverflow)?
             .checked_div(10_000).ok_or(EarthError::ArithmeticOverflow)?;
 
-        require!(inflation_amount > 0, EarthError::InflationAmountZero);
+        require!(total_inflation > 0, EarthError::InflationAmountZero);
+
+        let half = total_inflation.checked_div(2).ok_or(EarthError::ArithmeticOverflow)?;
+        // Give remainder to treasury so no tokens are lost
+        let treasury_half = total_inflation.checked_sub(half).ok_or(EarthError::ArithmeticOverflow)?;
 
         let bump = state.mint_authority_bump;
         let signer_seeds: &[&[&[u8]]] = &[&[MINT_AUTHORITY_SEED, &[bump]]];
 
+        // Mint 1.75% → community treasury
         token_2022::mint_to(
             CpiContext::new_with_signer(
                 ctx.accounts.token_program.to_account_info(),
@@ -354,15 +366,79 @@ pub mod earth {
                 },
                 signer_seeds,
             ),
-            inflation_amount,
+            treasury_half,
+        )?;
+
+        // Mint 1.75% → inflation pool (humans claim their share)
+        token_2022::mint_to(
+            CpiContext::new_with_signer(
+                ctx.accounts.token_program.to_account_info(),
+                MintTo {
+                    mint:      ctx.accounts.mint.to_account_info(),
+                    to:        ctx.accounts.inflation_pool_token_account.to_account_info(),
+                    authority: ctx.accounts.mint_authority.to_account_info(),
+                },
+                signer_seeds,
+            ),
+            half,
         )?;
 
         let state = &mut ctx.accounts.program_state;
         state.total_minted = state.total_minted
-            .checked_add(inflation_amount).ok_or(EarthError::ArithmeticOverflow)?;
+            .checked_add(total_inflation).ok_or(EarthError::ArithmeticOverflow)?;
         state.last_inflation_time = clock.unix_timestamp;
+        state.inflation_epoch = state.inflation_epoch
+            .checked_add(1).ok_or(EarthError::ArithmeticOverflow)?;
+        // Per-human share = half / total verified humans (0 if no humans yet)
+        state.last_inflation_per_human = if state.total_verified_humans > 0 {
+            half.checked_div(state.total_verified_humans).unwrap_or(0)
+        } else {
+            0
+        };
 
-        msg!("Annual inflation minted: {} tokens to treasury.", inflation_amount);
+        msg!("Annual inflation: {} to treasury, {} to human pool ({} each).",
+            treasury_half, half, state.last_inflation_per_human);
+        Ok(())
+    }
+
+    /// Each active verified human claims their equal share of the annual inflation pool.
+    /// Can only be called once per inflation epoch per human.
+    pub fn claim_inflation_share(ctx: Context<ClaimInflationShare>) -> Result<()> {
+        require!(!ctx.accounts.program_state.emergency_freeze, EarthError::SystemFrozen);
+
+        let state = &ctx.accounts.program_state;
+        require!(state.inflation_epoch > 0, EarthError::InflationAmountZero);
+
+        let human = &mut ctx.accounts.human_registry;
+        require!(human.is_registered, EarthError::NotRegistered);
+        require!(human.is_active, EarthError::HumanNotActive);
+        require!(!human.is_deceased, EarthError::HumanDeceased);
+        require!(
+            human.last_inflation_epoch_claimed < state.inflation_epoch,
+            EarthError::InflationAlreadyClaimed
+        );
+
+        let share = state.last_inflation_per_human;
+        require!(share > 0, EarthError::InflationAmountZero);
+
+        human.last_inflation_epoch_claimed = state.inflation_epoch;
+
+        let signer_seeds: &[&[&[u8]]] = &[&[INFLATION_POOL_SEED, &[ctx.bumps.inflation_pool_token_account]]];
+
+        token_2022::transfer(
+            CpiContext::new_with_signer(
+                ctx.accounts.token_program.to_account_info(),
+                Transfer {
+                    from:      ctx.accounts.inflation_pool_token_account.to_account_info(),
+                    to:        ctx.accounts.human_token_account.to_account_info(),
+                    authority: ctx.accounts.inflation_pool_token_account.to_account_info(),
+                },
+                signer_seeds,
+            ),
+            share,
+        )?;
+
+        msg!("Inflation share claimed: {} EARTH to {}", share, ctx.accounts.human.key());
         Ok(())
     }
 
@@ -645,6 +721,17 @@ pub struct InitializeMint<'info> {
     )]
     pub treasury_token_account: InterfaceAccount<'info, TokenAccount>,
 
+    #[account(
+        init,
+        payer = admin,
+        token::mint = mint,
+        token::authority = inflation_pool_token_account,
+        token::token_program = token_program,
+        seeds = [INFLATION_POOL_SEED],
+        bump,
+    )]
+    pub inflation_pool_token_account: InterfaceAccount<'info, TokenAccount>,
+
     pub token_program: Program<'info, Token2022>,
     pub system_program: Program<'info, System>,
     pub rent: Sysvar<'info, Rent>,
@@ -829,6 +916,43 @@ pub struct MintAnnualInflation<'info> {
         constraint = treasury_token_account.key() == program_state.treasury_token_account @ EarthError::InvalidTreasuryAccount,
     )]
     pub treasury_token_account: InterfaceAccount<'info, TokenAccount>,
+
+    #[account(
+        mut,
+        seeds = [INFLATION_POOL_SEED],
+        bump,
+        constraint = inflation_pool_token_account.key() == program_state.inflation_pool_token_account @ EarthError::InvalidInflationPoolAccount,
+    )]
+    pub inflation_pool_token_account: InterfaceAccount<'info, TokenAccount>,
+
+    pub token_program: Program<'info, Token2022>,
+}
+
+#[derive(Accounts)]
+pub struct ClaimInflationShare<'info> {
+    #[account(mut)]
+    pub human: Signer<'info>,
+
+    #[account(
+        mut,
+        seeds = [HUMAN_REGISTRY_SEED, human.key().as_ref()],
+        bump,
+        constraint = human_registry.wallet == human.key() @ EarthError::SenderWalletMismatch,
+    )]
+    pub human_registry: Account<'info, HumanRegistry>,
+
+    #[account(
+        mut,
+        seeds = [INFLATION_POOL_SEED],
+        bump,
+    )]
+    pub inflation_pool_token_account: InterfaceAccount<'info, TokenAccount>,
+
+    #[account(mut)]
+    pub human_token_account: InterfaceAccount<'info, TokenAccount>,
+
+    #[account(seeds = [PROGRAM_STATE_SEED], bump, constraint = program_state.is_initialized @ EarthError::NotInitialized)]
+    pub program_state: Account<'info, ProgramState>,
 
     pub token_program: Program<'info, Token2022>,
 }
@@ -1018,34 +1142,38 @@ pub struct EmergencyUnfreeze<'info> {
 #[account]
 #[derive(InitSpace)]
 pub struct ProgramState {
-    pub admin_authority:        Pubkey,
-    pub backup_authority:       Pubkey,  // Backup admin — in case primary wallet is lost
-    pub mint:                   Pubkey,
-    pub mint_authority_bump:    u8,
-    pub treasury_token_account: Pubkey,
-    pub oracle_data_account:    Pubkey,
-    pub total_minted:           u64,
-    pub total_birth_events:     u64,
-    pub total_verified_humans:  u64,
-    pub total_proposals:        u64,
-    pub is_initialized:         bool,
-    pub emergency_freeze:       bool,
-    pub freeze_reason:          [u8; 64],
-    pub freeze_timestamp:       i64,
-    pub last_inflation_time:    i64,
+    pub admin_authority:              Pubkey,
+    pub backup_authority:             Pubkey,  // Backup admin — in case primary wallet is lost
+    pub mint:                         Pubkey,
+    pub mint_authority_bump:          u8,
+    pub treasury_token_account:       Pubkey,
+    pub inflation_pool_token_account: Pubkey,  // 1.75% annual pool claimable by all humans
+    pub oracle_data_account:          Pubkey,
+    pub total_minted:                 u64,
+    pub total_birth_events:           u64,
+    pub total_verified_humans:        u64,
+    pub total_proposals:              u64,
+    pub is_initialized:               bool,
+    pub emergency_freeze:             bool,
+    pub freeze_reason:                [u8; 64],
+    pub freeze_timestamp:             i64,
+    pub last_inflation_time:          i64,
+    pub inflation_epoch:              u64,     // Increments each year inflation is minted
+    pub last_inflation_per_human:     u64,     // Tokens each human can claim this epoch
 }
 
 #[account]
 #[derive(InitSpace)]
 pub struct HumanRegistry {
-    pub is_registered:          bool,
-    pub iris_hash:              [u8; 32],
-    pub wallet:                 Pubkey,
-    pub registration_timestamp: i64,
-    pub is_active:              bool,
-    pub has_voted_count:        u64,
-    pub heir:                   Pubkey,  // Wallet to receive unclaimed vault on death
-    pub is_deceased:            bool,
+    pub is_registered:               bool,
+    pub iris_hash:                   [u8; 32],
+    pub wallet:                      Pubkey,
+    pub registration_timestamp:      i64,
+    pub is_active:                   bool,
+    pub has_voted_count:             u64,
+    pub heir:                        Pubkey,  // Wallet to receive unclaimed vault on death
+    pub is_deceased:                 bool,
+    pub last_inflation_epoch_claimed: u64,   // Last epoch this human claimed inflation share
 }
 
 #[account]
@@ -1200,4 +1328,8 @@ pub enum EarthError {
     HeirNotHuman,
     #[msg("Heir wallet mismatch.")]
     HeirWalletMismatch,
+    #[msg("Inflation share already claimed for this epoch.")]
+    InflationAlreadyClaimed,
+    #[msg("Invalid inflation pool account.")]
+    InvalidInflationPoolAccount,
 }
