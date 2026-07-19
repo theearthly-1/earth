@@ -14,23 +14,26 @@ declare_id!("EARTH111111111111111111111111111111111111111");
 pub const ADMIN_AUTHORITY: Pubkey = solana_program::pubkey!("FndrmgjS9iZ7wgnj58fp49W3cMSc3XEfBYkYA8J4cTH3");
 
 // ============================================================================
-// OWNERSHIP RULES — ENFORCED AT EVERY GATE
+// CLAIM RULES — THE ONLY GATE IS AT THE BEGINNING
 // ============================================================================
 //
-// EARTH tokens can only be owned, held, claimed, or transferred by verified
-// biological humans — individuals who have passed World ID iris verification.
+// EARTH tokens come into existence when a verified human claims them.
+// After that, they belong to that person — to hold, sell, trade, or transfer
+// however they choose. No restrictions on what happens after the claim.
 //
-// AI systems, bots, corporations, DAOs, smart contracts, and any non-human
-// entity are explicitly prohibited from holding or acquiring EARTH tokens.
+// The one rule that cannot be bypassed:
+//   - To claim your initial allocation: World ID iris verification required.
+//     One iris = one registration. One registration = one claim. Forever.
+//
+// Everything else — transfers, DEX trading, selling for other coins — is
+// unrestricted. The token is theirs once claimed.
 //
 // Enforcement layers:
-//   1. Registration: requires a valid World ID iris hash — physically impossible
-//      for a non-human to obtain. One iris = one registration. Forever.
-//   2. Transfer: transfer_with_human_check verifies BOTH sender and recipient
-//      are registered humans before any transfer is allowed.
-//   3. Claims: claim_vault and claim_inflation_share both require the claimer
+//   1. Registration: requires a valid World ID iris hash from the oracle.
+//      One iris = one registration. Cannot be reused.
+//   2. Claims: claim_vault and claim_inflation_share both require the claimer
 //      to be an active, non-deceased registered human.
-//   4. Oracle: the World ID oracle server must verify iris uniqueness and
+//   3. Oracle: the World ID oracle server must verify iris uniqueness and
 //      humanity before signing any register_human or mint instruction.
 //
 // These rules cannot be bypassed by governance vote. They are the foundation.
@@ -708,29 +711,6 @@ pub mod earth {
     // HUMAN-ONLY TRANSFER
     // ========================================================================
 
-    /// Transfers EARTH between two verified human wallets only.
-    /// This is how EARTH circulates — person to person, no banks in the middle.
-    pub fn transfer_with_human_check(
-        ctx: Context<TransferWithHumanCheck>,
-        amount: u64,
-    ) -> Result<()> {
-        require!(!ctx.accounts.program_state.emergency_freeze, EarthError::SystemFrozen);
-
-        token_2022::transfer(
-            CpiContext::new(
-                ctx.accounts.token_program.to_account_info(),
-                Transfer {
-                    from:      ctx.accounts.sender_token_account.to_account_info(),
-                    to:        ctx.accounts.recipient_token_account.to_account_info(),
-                    authority: ctx.accounts.sender.to_account_info(),
-                },
-            ),
-            amount,
-        )?;
-
-        msg!("Transfer: {} EARTH between verified humans.", amount);
-        Ok(())
-    }
 
     // ========================================================================
     // TREASURY SPEND — GOVERNANCE GATED
@@ -1437,44 +1417,6 @@ pub struct ClaimVault<'info> {
 }
 
 #[derive(Accounts)]
-pub struct TransferWithHumanCheck<'info> {
-    #[account(mut)]
-    pub sender: Signer<'info>,
-
-    /// CHECK: Recipient wallet.
-    pub recipient_wallet: UncheckedAccount<'info>,
-
-    #[account(
-        constraint = sender_human_registry.is_registered @ EarthError::SenderNotHuman,
-        constraint = sender_human_registry.is_active @ EarthError::HumanNotActive,
-        constraint = !sender_human_registry.is_deceased @ EarthError::HumanDeceased,
-        constraint = sender_human_registry.wallet == sender.key() @ EarthError::SenderWalletMismatch,
-        seeds = [HUMAN_REGISTRY_SEED, sender.key().as_ref()],
-        bump,
-    )]
-    pub sender_human_registry: Account<'info, HumanRegistry>,
-
-    #[account(
-        constraint = recipient_human_registry.is_registered @ EarthError::RecipientNotHuman,
-        constraint = recipient_human_registry.is_active @ EarthError::HumanNotActive,
-        constraint = !recipient_human_registry.is_deceased @ EarthError::HumanDeceased,
-        constraint = recipient_human_registry.wallet == recipient_wallet.key() @ EarthError::RecipientWalletMismatch,
-        seeds = [HUMAN_REGISTRY_SEED, recipient_wallet.key().as_ref()],
-        bump,
-    )]
-    pub recipient_human_registry: Account<'info, HumanRegistry>,
-
-    #[account(mut)]
-    pub sender_token_account: InterfaceAccount<'info, TokenAccount>,
-
-    #[account(mut)]
-    pub recipient_token_account: InterfaceAccount<'info, TokenAccount>,
-
-    #[account(seeds = [PROGRAM_STATE_SEED], bump, constraint = program_state.is_initialized @ EarthError::NotInitialized)]
-    pub program_state: Account<'info, ProgramState>,
-
-    pub token_program: Program<'info, Token2022>,
-}
 
 #[derive(Accounts)]
 pub struct ExecuteTreasurySpend<'info> {
@@ -1895,14 +1837,8 @@ pub enum EarthError {
     SpendProposalNotPassed,
     #[msg("Spend amount must be greater than zero.")]
     SpendAmountZero,
-    #[msg("Sender is not a verified human.")]
-    SenderNotHuman,
     #[msg("Sender wallet mismatch.")]
     SenderWalletMismatch,
-    #[msg("Recipient is not a verified human.")]
-    RecipientNotHuman,
-    #[msg("Recipient wallet mismatch.")]
-    RecipientWalletMismatch,
     #[msg("Claimer is not a registered human.")]
     ClaimerNotHuman,
     #[msg("Claimer is not active.")]
