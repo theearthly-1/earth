@@ -481,14 +481,6 @@ pub mod earth {
             EarthError::Milestone1NotReached
         );
 
-        let proposal = &ctx.accounts.milestone_proposal;
-        require!(proposal.is_executed, EarthError::SpendProposalNotExecuted);
-        require!(proposal.is_passed, EarthError::SpendProposalNotPassed);
-        require!(
-            proposal.proposal_type == ProposalType::ConfirmMilestone1,
-            EarthError::WrongProposalType
-        );
-
         // 50% of current treasury balance divided equally among all registered humans
         let treasury_balance = ctx.accounts.treasury_token_account.amount;
         let half = treasury_balance.checked_div(2).ok_or(EarthError::ArithmeticOverflow)?;
@@ -523,14 +515,6 @@ pub mod earth {
         require!(
             state.total_verified_humans >= MILESTONE_2_THRESHOLD,
             EarthError::Milestone2NotReached
-        );
-
-        let proposal = &ctx.accounts.milestone_proposal;
-        require!(proposal.is_executed, EarthError::SpendProposalNotExecuted);
-        require!(proposal.is_passed, EarthError::SpendProposalNotPassed);
-        require!(
-            proposal.proposal_type == ProposalType::ConfirmMilestone2,
-            EarthError::WrongProposalType
         );
 
         // All remaining treasury balance divided equally among all registered humans
@@ -1076,14 +1060,12 @@ pub struct FinalizeProposal<'info> {
 }
 
 /// Used by both confirm_milestone_1 and confirm_milestone_2.
-/// Admin submits with a passed governance proposal; treasury balance is read to calculate per-human amount.
+/// Permissionless — anyone can call once the on-chain verified human count hits the threshold.
+/// The contract verifies the number itself. No admin, no governance vote needed.
 #[derive(Accounts)]
 pub struct ConfirmMilestone<'info> {
-    #[account(mut)]
-    pub admin: Signer<'info>,
-
-    /// The governance proposal authorizing this milestone confirmation.
-    pub milestone_proposal: Account<'info, Proposal>,
+    /// CHECK: Anyone can trigger — permissionless.
+    pub caller: UncheckedAccount<'info>,
 
     /// Treasury account — balance read to calculate per-human distribution.
     #[account(
@@ -1098,7 +1080,6 @@ pub struct ConfirmMilestone<'info> {
         seeds = [PROGRAM_STATE_SEED],
         bump,
         constraint = program_state.is_initialized @ EarthError::NotInitialized,
-        constraint = is_admin(&admin.key(), &program_state) @ EarthError::UnauthorizedAdmin,
     )]
     pub program_state: Account<'info, ProgramState>,
 }
