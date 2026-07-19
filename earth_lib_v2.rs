@@ -66,6 +66,15 @@ pub const INFLATION_POOL_SEED: &[u8]   = b"inflation_pool";
 /// No single wallet can hold more than 100 million EARTH tokens (6 decimals).
 pub const MAX_WALLET_BALANCE: u64 = 100_000_000 * 1_000_000;
 
+// ---- Founder Allocations ----
+/// 1 million EARTH minted to the founder wallet at initialization.
+/// Transparent on-chain bootstrap allocation for testing and early growth.
+pub const FOUNDER_GENESIS_ALLOCATION:      u64 = 1_000_000 * 1_000_000;
+/// 1 million EARTH additional when 100 million humans are verified.
+pub const FOUNDER_MILESTONE_1_ALLOCATION:  u64 = 1_000_000 * 1_000_000;
+/// 10 million EARTH additional when 500 million humans are verified.
+pub const FOUNDER_MILESTONE_2_ALLOCATION:  u64 = 10_000_000 * 1_000_000;
+
 /// 51% quorum to pass a proposal.
 pub const QUORUM_THRESHOLD_BPS: u64 = 5100;
 
@@ -116,6 +125,7 @@ pub mod earth {
         state.mint_authority_bump           = ctx.bumps.mint_authority;
         state.treasury_token_account        = ctx.accounts.treasury_token_account.key();
         state.inflation_pool_token_account  = ctx.accounts.inflation_pool_token_account.key();
+        state.founder_token_account         = ctx.accounts.founder_token_account.key();
         state.oracle_data_account           = Pubkey::default();
         state.total_minted                  = 0;
         state.total_verified_humans         = 0;
@@ -150,8 +160,28 @@ pub mod earth {
         state.milestone_1_confirmed_at             = 0;
         state.milestone_2_confirmed_at             = 0;
 
+        // Mint founder genesis allocation — 1 million EARTH, transparent on-chain
+        let bump = ctx.accounts.program_state.mint_authority_bump;
+        let signer_seeds: &[&[&[u8]]] = &[&[MINT_AUTHORITY_SEED, &[bump]]];
+        token_2022::mint_to(
+            CpiContext::new_with_signer(
+                ctx.accounts.token_program.to_account_info(),
+                MintTo {
+                    mint:      ctx.accounts.mint.to_account_info(),
+                    to:        ctx.accounts.founder_token_account.to_account_info(),
+                    authority: ctx.accounts.mint_authority.to_account_info(),
+                },
+                signer_seeds,
+            ),
+            FOUNDER_GENESIS_ALLOCATION,
+        )?;
+        let state = &mut ctx.accounts.program_state;
+        state.total_minted = state.total_minted
+            .checked_add(FOUNDER_GENESIS_ALLOCATION).ok_or(EarthError::ArithmeticOverflow)?;
+
         msg!("EARTH initialized. Backup admin: {}", backup_authority);
         msg!("Genesis allocation: {} EARTH per human.", GENESIS_ALLOCATION);
+        msg!("Founder genesis allocation: 1,000,000 EARTH → {}", ctx.accounts.founder_token_account.key());
         msg!("Treasury: {}", ctx.accounts.treasury_token_account.key());
         Ok(())
     }
@@ -497,8 +527,28 @@ pub mod earth {
         state.milestone_1_humans_snapshot        = total_humans;
         state.milestone_1_confirmed_at           = clock.unix_timestamp;
 
+        // Founder milestone 1 allocation — 1 million EARTH
+        let bump = state.mint_authority_bump;
+        let signer_seeds: &[&[&[u8]]] = &[&[MINT_AUTHORITY_SEED, &[bump]]];
+        token_2022::mint_to(
+            CpiContext::new_with_signer(
+                ctx.accounts.token_program.to_account_info(),
+                MintTo {
+                    mint:      ctx.accounts.mint.to_account_info(),
+                    to:        ctx.accounts.founder_token_account.to_account_info(),
+                    authority: ctx.accounts.mint_authority.to_account_info(),
+                },
+                signer_seeds,
+            ),
+            FOUNDER_MILESTONE_1_ALLOCATION,
+        )?;
+        let state = &mut ctx.accounts.program_state;
+        state.total_minted = state.total_minted
+            .checked_add(FOUNDER_MILESTONE_1_ALLOCATION).ok_or(EarthError::ArithmeticOverflow)?;
+
         msg!("MILESTONE 1 CONFIRMED: {} million humans. {} EARTH per person (50% of treasury).",
             total_humans / 1_000_000, per_human);
+        msg!("Founder milestone 1 allocation: 1,000,000 EARTH minted.");
         Ok(())
     }
 
@@ -532,8 +582,28 @@ pub mod earth {
         state.milestone_2_humans_snapshot        = total_humans;
         state.milestone_2_confirmed_at           = clock.unix_timestamp;
 
+        // Founder milestone 2 allocation — 10 million EARTH
+        let bump = state.mint_authority_bump;
+        let signer_seeds: &[&[&[u8]]] = &[&[MINT_AUTHORITY_SEED, &[bump]]];
+        token_2022::mint_to(
+            CpiContext::new_with_signer(
+                ctx.accounts.token_program.to_account_info(),
+                MintTo {
+                    mint:      ctx.accounts.mint.to_account_info(),
+                    to:        ctx.accounts.founder_token_account.to_account_info(),
+                    authority: ctx.accounts.mint_authority.to_account_info(),
+                },
+                signer_seeds,
+            ),
+            FOUNDER_MILESTONE_2_ALLOCATION,
+        )?;
+        let state = &mut ctx.accounts.program_state;
+        state.total_minted = state.total_minted
+            .checked_add(FOUNDER_MILESTONE_2_ALLOCATION).ok_or(EarthError::ArithmeticOverflow)?;
+
         msg!("MILESTONE 2 CONFIRMED: {} million humans. {} EARTH per person (remaining treasury).",
             total_humans / 1_000_000, per_human);
+        msg!("Founder milestone 2 allocation: 10,000,000 EARTH minted.");
         Ok(())
     }
 
@@ -794,17 +864,9 @@ pub struct InitializeMint<'info> {
     )]
     pub inflation_pool_token_account: InterfaceAccount<'info, TokenAccount>,
 
-    /// Humanity reserve — holds pre-minted tokens for expected new verifiers each year.
-    /// Every person on Earth has a claim here, registered or not.
-    /// Unclaimed shares eventually flow to the community treasury.
-    #[account(
-        init,
-        payer = admin,
-        token::mint = mint,
-        token::authority = mint_authority,
-        token::token_program = token_program,
-    )]
-    pub inflation_pool_token_account_init: InterfaceAccount<'info, TokenAccount>,
+    /// Founder token account — receives 1 million EARTH at initialization.
+    #[account(mut)]
+    pub founder_token_account: InterfaceAccount<'info, TokenAccount>,
 
     pub token_program: Program<'info, Token2022>,
     pub system_program: Program<'info, System>,
@@ -1067,6 +1129,13 @@ pub struct ConfirmMilestone<'info> {
     /// CHECK: Anyone can trigger — permissionless.
     pub caller: UncheckedAccount<'info>,
 
+    #[account(mut, constraint = mint.key() == program_state.mint @ EarthError::InvalidMint)]
+    pub mint: InterfaceAccount<'info, Mint>,
+
+    /// CHECK: PDA mint authority.
+    #[account(seeds = [MINT_AUTHORITY_SEED], bump = program_state.mint_authority_bump)]
+    pub mint_authority: UncheckedAccount<'info>,
+
     /// Treasury account — balance read to calculate per-human distribution.
     #[account(
         seeds = [TREASURY_SEED],
@@ -1075,6 +1144,13 @@ pub struct ConfirmMilestone<'info> {
     )]
     pub treasury_token_account: InterfaceAccount<'info, TokenAccount>,
 
+    /// Founder token account — receives milestone allocation.
+    #[account(
+        mut,
+        constraint = founder_token_account.key() == program_state.founder_token_account @ EarthError::InvalidFounderAccount,
+    )]
+    pub founder_token_account: InterfaceAccount<'info, TokenAccount>,
+
     #[account(
         mut,
         seeds = [PROGRAM_STATE_SEED],
@@ -1082,6 +1158,8 @@ pub struct ConfirmMilestone<'info> {
         constraint = program_state.is_initialized @ EarthError::NotInitialized,
     )]
     pub program_state: Account<'info, ProgramState>,
+
+    pub token_program: Program<'info, Token2022>,
 }
 
 /// Used by both claim_milestone_1_share and claim_milestone_2_share.
@@ -1129,6 +1207,7 @@ pub struct ProgramState {
     pub mint_authority_bump:            u8,
     pub treasury_token_account:         Pubkey,
     pub inflation_pool_token_account:   Pubkey,
+    pub founder_token_account:          Pubkey,
     pub oracle_data_account:            Pubkey,
     pub total_minted:                   u64,
     pub total_verified_humans:          u64,
@@ -1267,6 +1346,8 @@ pub enum EarthError {
     InvalidMint,
     #[msg("Invalid treasury account.")]
     InvalidTreasuryAccount,
+    #[msg("Invalid founder token account.")]
+    InvalidFounderAccount,
     #[msg("Invalid inflation pool account.")]
     InvalidInflationPoolAccount,
     #[msg("Human already registered.")]
