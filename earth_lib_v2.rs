@@ -31,8 +31,8 @@ pub const ADMIN_AUTHORITY: Pubkey = solana_program::pubkey!("FndrmgjS9iZ7wgnj58f
 // Enforcement layers:
 //   1. Registration: requires a valid World ID iris hash from the oracle.
 //      One iris = one registration. Cannot be reused.
-//   2. Claims: claim_vault and claim_inflation_share both require the claimer
-//      to be an active, non-deceased registered human.
+//   2. Claims: claim_allocation and claim_inflation_share both require the
+//      claimer to be an active registered human.
 //   3. Oracle: the World ID oracle server must verify iris uniqueness and
 //      humanity before signing any register_human or mint instruction.
 //
@@ -57,13 +57,14 @@ pub const ONE_YEAR_SECONDS: i64 = 31_536_000;
 /// PDA seeds.
 pub const MINT_AUTHORITY_SEED: &[u8]    = b"mint_authority";
 pub const PROGRAM_STATE_SEED: &[u8]     = b"program_state";
-pub const VAULT_SEED: &[u8]             = b"vault";
 pub const HUMAN_REGISTRY_SEED: &[u8]   = b"human_registry";
 pub const PROPOSAL_SEED: &[u8]         = b"proposal";
 pub const VOTE_SEED: &[u8]             = b"vote";
 pub const TREASURY_SEED: &[u8]         = b"treasury";
 pub const INFLATION_POOL_SEED: &[u8]   = b"inflation_pool";
-pub const HUMANITY_RESERVE_SEED: &[u8] = b"humanity_reserve";
+
+/// No single wallet can hold more than 100 million EARTH tokens (6 decimals).
+pub const MAX_WALLET_BALANCE: u64 = 100_000_000 * 1_000_000;
 
 /// 51% quorum to pass a proposal.
 pub const QUORUM_THRESHOLD_BPS: u64 = 5100;
@@ -115,10 +116,8 @@ pub mod earth {
         state.mint_authority_bump           = ctx.bumps.mint_authority;
         state.treasury_token_account        = ctx.accounts.treasury_token_account.key();
         state.inflation_pool_token_account  = ctx.accounts.inflation_pool_token_account.key();
-        state.humanity_reserve_token_account = ctx.accounts.humanity_reserve_token_account.key();
         state.oracle_data_account           = Pubkey::default();
         state.total_minted                  = 0;
-        state.total_birth_events            = 0;
         state.total_verified_humans         = 0;
         state.total_proposals               = 0;
         state.is_initialized                = true;
@@ -154,7 +153,6 @@ pub mod earth {
         msg!("EARTH initialized. Backup admin: {}", backup_authority);
         msg!("Genesis allocation: {} EARTH per human.", GENESIS_ALLOCATION);
         msg!("Treasury: {}", ctx.accounts.treasury_token_account.key());
-        msg!("Humanity reserve: {}", ctx.accounts.humanity_reserve_token_account.key());
         Ok(())
     }
 
@@ -181,16 +179,8 @@ pub mod earth {
     ///
     /// Effect:
     ///   - current_allocation grows by growth_bps (new verifiers get more EARTH)
-    ///   - existing registered humans' vaults are NOT retroactively changed —
-    ///     they receive their growth share via the inflation pool claim each year
-    ///   - Mints estimated_new_verifiers × current_allocation into humanity reserve pool
-    ///     so tokens are "ready" for the humans expected to verify this year
+    ///   - existing humans receive their growth share via the inflation pool each year
     ///   - Updates estimated_world_population for on-chain transparency
-    ///
-    /// Why humanity reserve?
-    ///   Every person on Earth has a claim to their allocation whether registered or not.
-    ///   The reserve holds tokens waiting for people who haven't verified yet.
-    ///   If someone passes without claiming, their share flows to community treasury.
     ///
     /// Permissioned: admin submits the number with a public source citation (off-chain).
     /// Governance can reject within 30 days via a passed AnnualRevaluation proposal.
@@ -228,34 +218,6 @@ pub mod earth {
         let new_allocation = state.current_allocation
             .checked_add(growth_amount).ok_or(EarthError::ArithmeticOverflow)?;
 
-        // --- Mint humanity reserve for expected new verifiers this year ---
-        // These tokens sit in reserve, ready for people to claim when they verify.
-        // If unclaimed at next revaluation, governance can redirect to treasury.
-        let reserve_mint_amount = if estimated_new_verifiers_this_year > 0 {
-            estimated_new_verifiers_this_year
-                .checked_mul(new_allocation).ok_or(EarthError::ArithmeticOverflow)?
-        } else {
-            0
-        };
-
-        let bump = state.mint_authority_bump;
-        let signer_seeds: &[&[&[u8]]] = &[&[MINT_AUTHORITY_SEED, &[bump]]];
-
-        if reserve_mint_amount > 0 {
-            token_2022::mint_to(
-                CpiContext::new_with_signer(
-                    ctx.accounts.token_program.to_account_info(),
-                    MintTo {
-                        mint:      ctx.accounts.mint.to_account_info(),
-                        to:        ctx.accounts.humanity_reserve_token_account.to_account_info(),
-                        authority: ctx.accounts.mint_authority.to_account_info(),
-                    },
-                    signer_seeds,
-                ),
-                reserve_mint_amount,
-            )?;
-        }
-
         // --- Update state ---
         let state = &mut ctx.accounts.program_state;
         state.current_allocation         = new_allocation;
@@ -266,16 +228,9 @@ pub mod earth {
         state.revaluation_epoch          = state.revaluation_epoch
             .checked_add(1).ok_or(EarthError::ArithmeticOverflow)?;
 
-        if reserve_mint_amount > 0 {
-            state.total_minted = state.total_minted
-                .checked_add(reserve_mint_amount).ok_or(EarthError::ArithmeticOverflow)?;
-        }
-
         msg!("Annual revaluation complete. Epoch: {}", state.revaluation_epoch);
         msg!("New per-human allocation: {} EARTH (grew {}bps).", new_allocation, growth_bps);
         msg!("Estimated world population: {}", estimated_world_population);
-        msg!("Humanity reserve minted: {} for ~{} expected new verifiers.",
-            reserve_mint_amount, estimated_new_verifiers_this_year);
         Ok(())
     }
 
@@ -312,16 +267,12 @@ pub mod earth {
         human.iris_hash                  = iris_hash;
         human.wallet                     = ctx.accounts.human_wallet.key();
         human.registration_timestamp     = Clock::get()?.unix_timestamp;
-        human.is_active                  = true;
-        human.has_voted_count            = 0;
-        human.heir                       = Pubkey::default();
-        human.is_deceased                = false;
+        human.is_active                    = true;
+        human.has_voted_count              = 0;
         human.last_inflation_epoch_claimed = 0;
-        // Record allocation at registration — used for vault top-up calculations
-        human.allocation_at_registration = ctx.accounts.program_state.current_allocation;
-        // Milestone claim tracking
-        human.milestone_1_claimed = false;
-        human.milestone_2_claimed = false;
+        human.has_claimed_allocation       = false;
+        human.milestone_1_claimed          = false;
+        human.milestone_2_claimed          = false;
 
         let state = &mut ctx.accounts.program_state;
         state.total_verified_humans = state.total_verified_humans
@@ -331,162 +282,41 @@ pub mod earth {
         Ok(())
     }
 
-    // ========================================================================
-    // HEIR DESIGNATION — SET BEFORE YOU DIE
-    // ========================================================================
-
-    /// A verified human sets their heir — another verified human wallet.
-    /// If they die with an unclaimed vault and an heir is set,
-    /// the vault transfers to the heir instead of the community treasury.
-    pub fn set_heir(
-        ctx: Context<SetHeir>,
-        heir_wallet: Pubkey,
-    ) -> Result<()> {
-
-        let human = &mut ctx.accounts.human_registry;
-        require!(human.is_registered, EarthError::NotRegistered);
-        require!(human.is_active, EarthError::HumanNotActive);
-        require!(!human.is_deceased, EarthError::HumanDeceased);
-
-        if heir_wallet != Pubkey::default() {
-            require!(
-                ctx.accounts.heir_registry.is_registered,
-                EarthError::HeirNotHuman
-            );
-            require!(
-                ctx.accounts.heir_registry.wallet == heir_wallet,
-                EarthError::HeirWalletMismatch
-            );
-        }
-
-        human.heir = heir_wallet;
-        msg!("Heir set to: {}", heir_wallet);
-        Ok(())
-    }
 
     // ========================================================================
-    // DEATH DECLARATION — ORACLE ONLY
+    // CLAIM INITIAL ALLOCATION
     // ========================================================================
 
-    /// The oracle declares a human deceased.
-    /// - Marks their registry as inactive and deceased.
-    /// - If they have an unclaimed vault: transfers it to heir (if set) or treasury.
-    pub fn declare_deceased(
-        ctx: Context<DeclareDeceased>,
-        _birth_event_id: [u8; 32],
-    ) -> Result<()> {
+    /// A registered human claims their EARTH allocation.
+    /// Tokens are created at this moment — they do not exist beforehand.
+    /// Mints directly to the human's wallet and equal amount to treasury.
+    /// Can only be called once. Enforces the 100 million EARTH wallet cap.
+    pub fn claim_allocation(ctx: Context<ClaimAllocation>) -> Result<()> {
         let state = &ctx.accounts.program_state;
-        require_keys_eq!(
-            ctx.accounts.oracle_signer.key(),
-            state.oracle_data_account,
-            EarthError::UnauthorizedOracle
+
+        let allocation = state.current_allocation;
+
+        // Enforce 100 million EARTH wallet cap
+        let current_balance = ctx.accounts.human_token_account.amount;
+        require!(
+            current_balance.checked_add(allocation).ok_or(EarthError::ArithmeticOverflow)?
+                <= MAX_WALLET_BALANCE,
+            EarthError::WalletCapExceeded
         );
 
         let human = &mut ctx.accounts.human_registry;
-        require!(human.is_registered, EarthError::NotRegistered);
-        require!(!human.is_deceased, EarthError::HumanDeceased);
+        human.has_claimed_allocation = true;
 
-        human.is_active   = false;
-        human.is_deceased = true;
-
-        let vault = &mut ctx.accounts.vault_state;
-        if vault.is_initialized && !vault.is_claimed {
-            vault.is_claimed = true;
-
-            let birth_event_id = vault.birth_event_id;
-            let vault_bump     = vault.vault_bump;
-            let amount         = vault.amount;
-            let heir           = human.heir;
-
-            let signer: &[&[&[u8]]] = &[&[VAULT_SEED, &birth_event_id, &[vault_bump]]];
-
-            let destination = ctx.accounts.destination_token_account.to_account_info();
-
-            token_2022::transfer(
-                CpiContext::new_with_signer(
-                    ctx.accounts.token_program.to_account_info(),
-                    Transfer {
-                        from:      ctx.accounts.vault_token_account.to_account_info(),
-                        to:        destination,
-                        authority: ctx.accounts.vault_state.to_account_info(),
-                    },
-                    signer,
-                ),
-                amount,
-            )?;
-
-            if heir != Pubkey::default() {
-                msg!("Deceased vault transferred to heir: {}", heir);
-            } else {
-                msg!("Deceased vault returned to community treasury.");
-            }
-        }
-
-        msg!("Human declared deceased: {}", human.wallet);
-        Ok(())
-    }
-
-    // ========================================================================
-    // MINTING — DUAL ALLOCATION (HUMAN + COMMUNITY POOL)
-    // ========================================================================
-
-    /// Mints the CURRENT year's allocation to the beneficiary vault AND
-    /// the same amount to the community treasury pool simultaneously.
-    ///
-    /// The allocation amount is NOT fixed — it reflects Earth's current value
-    /// as updated by the annual revaluation. A person verifying in year 5
-    /// gets more EARTH than someone who verified at genesis, because Earth
-    /// is worth more. Everyone's share grows equally.
-    ///
-    /// Priority: attempts to draw from humanity reserve pool first (pre-minted
-    /// tokens held for expected new verifiers). Falls back to fresh mint if
-    /// the reserve is insufficient.
-    pub fn mint_birth_allocation(
-        ctx: Context<MintBirthAllocation>,
-        birth_event_id: [u8; 32],
-        beneficiary: Pubkey,
-        is_minor: bool,
-        birth_timestamp: i64,
-    ) -> Result<()> {
-        let state = &ctx.accounts.program_state;
-        require!(state.oracle_data_account != Pubkey::default(), EarthError::OracleNotSet);
-        require_keys_eq!(
-            ctx.accounts.oracle_signer.key(),
-            state.oracle_data_account,
-            EarthError::UnauthorizedOracle
-        );
-
-        let vault = &mut ctx.accounts.vault_state;
-        require!(!vault.is_initialized, EarthError::BirthEventAlreadyProcessed);
-
-        // Use the LIVE allocation — grows each year with Earth's value
-        let allocation = ctx.accounts.program_state.current_allocation;
-
-        vault.is_initialized      = true;
-        vault.birth_event_id      = birth_event_id;
-        vault.beneficiary         = beneficiary;
-        vault.is_minor            = is_minor;
-        vault.birth_timestamp     = birth_timestamp;
-        vault.amount              = allocation;
-        vault.is_claimed          = false;
-        vault.vault_token_account = ctx.accounts.vault_token_account.key();
-        vault.vault_bump          = ctx.bumps.vault_state;
-        vault.unlock_timestamp    = if is_minor {
-            birth_timestamp.checked_add(568_036_800).ok_or(EarthError::ArithmeticOverflow)?
-        } else {
-            0
-        };
-
-        let bump = ctx.accounts.program_state.mint_authority_bump;
+        let bump = state.mint_authority_bump;
         let signer_seeds: &[&[&[u8]]] = &[&[MINT_AUTHORITY_SEED, &[bump]]];
 
-        // Mint current_allocation → individual vault
+        // Mint allocation directly to human's wallet
         token_2022::mint_to(
             CpiContext::new_with_signer(
                 ctx.accounts.token_program.to_account_info(),
                 MintTo {
                     mint:      ctx.accounts.mint.to_account_info(),
-                    to:        ctx.accounts.vault_token_account.to_account_info(),
+                    to:        ctx.accounts.human_token_account.to_account_info(),
                     authority: ctx.accounts.mint_authority.to_account_info(),
                 },
                 signer_seeds,
@@ -494,7 +324,7 @@ pub mod earth {
             allocation,
         )?;
 
-        // Mint current_allocation → community treasury pool
+        // Mint equal amount to community treasury
         token_2022::mint_to(
             CpiContext::new_with_signer(
                 ctx.accounts.token_program.to_account_info(),
@@ -512,10 +342,8 @@ pub mod earth {
         let state = &mut ctx.accounts.program_state;
         state.total_minted = state.total_minted
             .checked_add(total_minted).ok_or(EarthError::ArithmeticOverflow)?;
-        state.total_birth_events = state.total_birth_events
-            .checked_add(1).ok_or(EarthError::ArithmeticOverflow)?;
 
-        msg!("{} EARTH → vault | {} → treasury | Beneficiary: {}", allocation, allocation, beneficiary);
+        msg!("{} EARTH → {} | {} → treasury", allocation, ctx.accounts.human.key(), allocation);
         Ok(())
     }
 
@@ -612,7 +440,6 @@ pub mod earth {
         let human = &mut ctx.accounts.human_registry;
         require!(human.is_registered, EarthError::NotRegistered);
         require!(human.is_active, EarthError::HumanNotActive);
-        require!(!human.is_deceased, EarthError::HumanDeceased);
         require!(
             human.last_inflation_epoch_claimed < state.inflation_epoch,
             EarthError::InflationAlreadyClaimed
@@ -643,66 +470,7 @@ pub mod earth {
     }
 
     // ========================================================================
-    // CLAIM VAULT
-    // ========================================================================
-
-    /// Verified human claims their EARTH allocation from their personal vault.
-    pub fn claim_vault(ctx: Context<ClaimVault>) -> Result<()> {
-
-        let vault = &mut ctx.accounts.vault_state;
-        require!(vault.is_initialized, EarthError::VaultNotInitialized);
-        require!(!vault.is_claimed, EarthError::VaultAlreadyClaimed);
-        require_keys_eq!(
-            ctx.accounts.beneficiary.key(),
-            vault.beneficiary,
-            EarthError::UnauthorizedBeneficiary
-        );
-
-        let claimer_registry = &ctx.accounts.beneficiary_human_registry;
-        require!(claimer_registry.is_registered, EarthError::ClaimerNotHuman);
-        require!(claimer_registry.is_active, EarthError::ClaimerNotActive);
-        require!(!claimer_registry.is_deceased, EarthError::HumanDeceased);
-
-        if vault.is_minor {
-            require!(
-                Clock::get()?.unix_timestamp >= vault.unlock_timestamp,
-                EarthError::VaultTimeLocked
-            );
-        }
-
-        let birth_event_id = vault.birth_event_id;
-        let vault_bump     = vault.vault_bump;
-        let claim_amount   = vault.amount;
-        let beneficiary    = vault.beneficiary;
-        vault.is_claimed   = true;
-        drop(vault);
-
-        let signer: &[&[&[u8]]] = &[&[VAULT_SEED, &birth_event_id, &[vault_bump]]];
-
-        token_2022::transfer(
-            CpiContext::new_with_signer(
-                ctx.accounts.token_program.to_account_info(),
-                Transfer {
-                    from:      ctx.accounts.vault_token_account.to_account_info(),
-                    to:        ctx.accounts.beneficiary_token_account.to_account_info(),
-                    authority: ctx.accounts.vault_state.to_account_info(),
-                },
-                signer,
-            ),
-            claim_amount,
-        )?;
-
-        msg!("Vault claimed: {} EARTH to {}", claim_amount, beneficiary);
-        Ok(())
-    }
-
-    // ========================================================================
-    // HUMAN-ONLY TRANSFER
-    // ========================================================================
-
-
-    // ========================================================================
-    // TREASURY SPEND — GOVERNANCE GATED
+    // TREASURY MILESTONE UNLOCKS
     // ========================================================================
 
     // ========================================================================
@@ -808,7 +576,6 @@ pub mod earth {
         let human = &mut ctx.accounts.human_registry;
         require!(human.is_registered, EarthError::NotRegistered);
         require!(human.is_active, EarthError::HumanNotActive);
-        require!(!human.is_deceased, EarthError::HumanDeceased);
         require!(!human.milestone_1_claimed, EarthError::Milestone1ShareAlreadyClaimed);
 
         // Only humans registered before the milestone was confirmed are eligible
@@ -853,7 +620,6 @@ pub mod earth {
         let human = &mut ctx.accounts.human_registry;
         require!(human.is_registered, EarthError::NotRegistered);
         require!(human.is_active, EarthError::HumanNotActive);
-        require!(!human.is_deceased, EarthError::HumanDeceased);
         require!(!human.milestone_2_claimed, EarthError::Milestone2ShareAlreadyClaimed);
 
         // Only humans registered before the milestone was confirmed are eligible
@@ -927,7 +693,6 @@ pub mod earth {
     pub fn cast_vote(ctx: Context<CastVote>, vote_choice: bool) -> Result<()> {
         require!(ctx.accounts.voter_human_registry.is_registered, EarthError::VoterNotHuman);
         require!(ctx.accounts.voter_human_registry.is_active, EarthError::VoterNotActive);
-        require!(!ctx.accounts.voter_human_registry.is_deceased, EarthError::HumanDeceased);
         require_keys_eq!(
             ctx.accounts.voter_human_registry.wallet,
             ctx.accounts.voter.key(),
@@ -1064,10 +829,8 @@ pub struct InitializeMint<'info> {
         token::mint = mint,
         token::authority = mint_authority,
         token::token_program = token_program,
-        seeds = [HUMANITY_RESERVE_SEED],
-        bump,
     )]
-    pub humanity_reserve_token_account: InterfaceAccount<'info, TokenAccount>,
+    pub inflation_pool_token_account_init: InterfaceAccount<'info, TokenAccount>,
 
     pub token_program: Program<'info, Token2022>,
     pub system_program: Program<'info, System>,
@@ -1111,14 +874,6 @@ pub struct SubmitAnnualRevaluation<'info> {
     )]
     pub program_state: Account<'info, ProgramState>,
 
-    #[account(
-        mut,
-        seeds = [HUMANITY_RESERVE_SEED],
-        bump,
-        constraint = humanity_reserve_token_account.key() == program_state.humanity_reserve_token_account @ EarthError::InvalidHumanityReserveAccount,
-    )]
-    pub humanity_reserve_token_account: InterfaceAccount<'info, TokenAccount>,
-
     pub token_program: Program<'info, Token2022>,
 }
 
@@ -1152,112 +907,6 @@ pub struct RegisterHuman<'info> {
 }
 
 #[derive(Accounts)]
-pub struct SetHeir<'info> {
-    #[account(mut)]
-    pub human: Signer<'info>,
-
-    #[account(
-        mut,
-        seeds = [HUMAN_REGISTRY_SEED, human.key().as_ref()],
-        bump,
-        constraint = human_registry.wallet == human.key() @ EarthError::SenderWalletMismatch,
-    )]
-    pub human_registry: Account<'info, HumanRegistry>,
-
-    pub heir_registry: Account<'info, HumanRegistry>,
-
-    #[account(seeds = [PROGRAM_STATE_SEED], bump, constraint = program_state.is_initialized @ EarthError::NotInitialized)]
-    pub program_state: Account<'info, ProgramState>,
-}
-
-#[derive(Accounts)]
-#[instruction(_birth_event_id: [u8; 32])]
-pub struct DeclareDeceased<'info> {
-    #[account(mut)]
-    pub oracle_signer: Signer<'info>,
-
-    /// CHECK: The deceased person's wallet.
-    pub deceased_wallet: UncheckedAccount<'info>,
-
-    #[account(
-        mut,
-        seeds = [HUMAN_REGISTRY_SEED, deceased_wallet.key().as_ref()],
-        bump,
-    )]
-    pub human_registry: Account<'info, HumanRegistry>,
-
-    #[account(
-        mut,
-        seeds = [VAULT_SEED, &_birth_event_id],
-        bump,
-    )]
-    pub vault_state: Account<'info, VaultState>,
-
-    #[account(
-        mut,
-        constraint = vault_token_account.key() == vault_state.vault_token_account @ EarthError::InvalidVaultTokenAccount,
-    )]
-    pub vault_token_account: InterfaceAccount<'info, TokenAccount>,
-
-    /// Destination: heir's token account OR treasury (caller passes the correct one).
-    #[account(mut)]
-    pub destination_token_account: InterfaceAccount<'info, TokenAccount>,
-
-    #[account(seeds = [PROGRAM_STATE_SEED], bump, constraint = program_state.is_initialized @ EarthError::NotInitialized)]
-    pub program_state: Account<'info, ProgramState>,
-
-    pub token_program: Program<'info, Token2022>,
-}
-
-#[derive(Accounts)]
-#[instruction(birth_event_id: [u8; 32])]
-pub struct MintBirthAllocation<'info> {
-    #[account(mut)]
-    pub oracle_signer: Signer<'info>,
-
-    #[account(mut, constraint = mint.key() == program_state.mint @ EarthError::InvalidMint)]
-    pub mint: InterfaceAccount<'info, Mint>,
-
-    /// CHECK: PDA mint authority.
-    #[account(seeds = [MINT_AUTHORITY_SEED], bump = program_state.mint_authority_bump)]
-    pub mint_authority: UncheckedAccount<'info>,
-
-    #[account(
-        mut,
-        seeds = [PROGRAM_STATE_SEED],
-        bump,
-        constraint = program_state.is_initialized @ EarthError::NotInitialized,
-    )]
-    pub program_state: Account<'info, ProgramState>,
-
-    #[account(
-        init,
-        payer = oracle_signer,
-        space = 8 + VaultState::INIT_SPACE,
-        seeds = [VAULT_SEED, &birth_event_id],
-        bump,
-    )]
-    pub vault_state: Account<'info, VaultState>,
-
-    #[account(
-        init,
-        payer = oracle_signer,
-        token::mint = mint,
-        token::authority = vault_state,
-        token::token_program = token_program,
-    )]
-    pub vault_token_account: InterfaceAccount<'info, TokenAccount>,
-
-    #[account(
-        mut,
-        constraint = treasury_token_account.key() == program_state.treasury_token_account @ EarthError::InvalidTreasuryAccount,
-    )]
-    pub treasury_token_account: InterfaceAccount<'info, TokenAccount>,
-
-    pub token_program: Program<'info, Token2022>,
-    pub system_program: Program<'info, System>,
-    pub rent: Sysvar<'info, Rent>,
-}
 
 #[derive(Accounts)]
 pub struct MintAnnualInflation<'info> {
@@ -1326,71 +975,42 @@ pub struct ClaimInflationShare<'info> {
 }
 
 #[derive(Accounts)]
-pub struct ClaimVault<'info> {
+pub struct ClaimAllocation<'info> {
     #[account(mut)]
-    pub beneficiary: Signer<'info>,
+    pub human: Signer<'info>,
 
     #[account(
         mut,
-        constraint = vault_state.is_initialized @ EarthError::VaultNotInitialized,
-        constraint = !vault_state.is_claimed @ EarthError::VaultAlreadyClaimed,
-        constraint = vault_state.beneficiary == beneficiary.key() @ EarthError::UnauthorizedBeneficiary,
-    )]
-    pub vault_state: Account<'info, VaultState>,
-
-    #[account(
-        mut,
-        constraint = vault_token_account.key() == vault_state.vault_token_account @ EarthError::InvalidVaultTokenAccount,
-    )]
-    pub vault_token_account: InterfaceAccount<'info, TokenAccount>,
-
-    #[account(mut)]
-    pub beneficiary_token_account: InterfaceAccount<'info, TokenAccount>,
-
-    #[account(
-        constraint = beneficiary_human_registry.is_registered @ EarthError::ClaimerNotHuman,
-        constraint = beneficiary_human_registry.wallet == beneficiary.key() @ EarthError::ClaimerWalletMismatch,
-        seeds = [HUMAN_REGISTRY_SEED, beneficiary.key().as_ref()],
+        seeds = [HUMAN_REGISTRY_SEED, human.key().as_ref()],
         bump,
+        constraint = human_registry.is_registered @ EarthError::NotRegistered,
+        constraint = human_registry.is_active @ EarthError::HumanNotActive,
+        constraint = !human_registry.has_claimed_allocation @ EarthError::AllocationAlreadyClaimed,
+        constraint = human_registry.wallet == human.key() @ EarthError::SenderWalletMismatch,
     )]
-    pub beneficiary_human_registry: Account<'info, HumanRegistry>,
+    pub human_registry: Account<'info, HumanRegistry>,
 
-    #[account(seeds = [PROGRAM_STATE_SEED], bump, constraint = program_state.is_initialized @ EarthError::NotInitialized)]
-    pub program_state: Account<'info, ProgramState>,
+    #[account(mut, constraint = mint.key() == program_state.mint @ EarthError::InvalidMint)]
+    pub mint: InterfaceAccount<'info, Mint>,
 
-    pub token_program: Program<'info, Token2022>,
-    pub system_program: Program<'info, System>,
-}
+    /// CHECK: PDA mint authority.
+    #[account(seeds = [MINT_AUTHORITY_SEED], bump = program_state.mint_authority_bump)]
+    pub mint_authority: UncheckedAccount<'info>,
 
-#[derive(Accounts)]
-
-#[derive(Accounts)]
-pub struct ExecuteTreasurySpend<'info> {
     #[account(mut)]
-    pub executor: Signer<'info>,
-
-    /// The governance proposal that authorized this spend.
-    /// Must be type TreasurySpend, executed, and passed.
-    #[account(
-        constraint = spend_proposal.proposal_type == ProposalType::TreasurySpend @ EarthError::WrongProposalType,
-        constraint = spend_proposal.is_executed @ EarthError::SpendProposalNotExecuted,
-        constraint = spend_proposal.is_passed @ EarthError::SpendProposalNotPassed,
-    )]
-    pub spend_proposal: Account<'info, Proposal>,
+    pub human_token_account: InterfaceAccount<'info, TokenAccount>,
 
     #[account(
         mut,
-        seeds = [TREASURY_SEED],
-        bump,
         constraint = treasury_token_account.key() == program_state.treasury_token_account @ EarthError::InvalidTreasuryAccount,
     )]
     pub treasury_token_account: InterfaceAccount<'info, TokenAccount>,
 
-    /// Destination approved by governance (verified off-chain via description_hash).
-    #[account(mut)]
-    pub destination_token_account: InterfaceAccount<'info, TokenAccount>,
-
-    #[account(seeds = [PROGRAM_STATE_SEED], bump, constraint = program_state.is_initialized @ EarthError::NotInitialized)]
+    #[account(
+        seeds = [PROGRAM_STATE_SEED],
+        bump,
+        constraint = program_state.is_initialized @ EarthError::NotInitialized,
+    )]
     pub program_state: Account<'info, ProgramState>,
 
     pub token_program: Program<'info, Token2022>,
@@ -1538,10 +1158,8 @@ pub struct ProgramState {
     pub mint_authority_bump:            u8,
     pub treasury_token_account:         Pubkey,
     pub inflation_pool_token_account:   Pubkey,
-    pub humanity_reserve_token_account: Pubkey,  // Pre-minted pool for expected new verifiers
     pub oracle_data_account:            Pubkey,
     pub total_minted:                   u64,
-    pub total_birth_events:             u64,
     pub total_verified_humans:          u64,
     pub total_proposals:                u64,
     pub is_initialized:                 bool,
@@ -1609,32 +1227,10 @@ pub struct HumanRegistry {
     pub registration_timestamp:       i64,
     pub is_active:                    bool,
     pub has_voted_count:              u64,
-    pub heir:                         Pubkey,
-    pub is_deceased:                  bool,
     pub last_inflation_epoch_claimed: u64,
-    /// Allocation amount at time of registration — useful for top-up calculations
-    pub allocation_at_registration:   u64,
-
-    /// Whether this human has claimed their Milestone 1 (100M) treasury distribution.
+    pub has_claimed_allocation:       bool,
     pub milestone_1_claimed:          bool,
-
-    /// Whether this human has claimed their Milestone 2 (500M) treasury distribution.
     pub milestone_2_claimed:          bool,
-}
-
-#[account]
-#[derive(InitSpace)]
-pub struct VaultState {
-    pub is_initialized:      bool,
-    pub birth_event_id:      [u8; 32],
-    pub beneficiary:         Pubkey,
-    pub is_minor:            bool,
-    pub birth_timestamp:     i64,
-    pub unlock_timestamp:    i64,
-    pub amount:              u64,
-    pub is_claimed:          bool,
-    pub vault_token_account: Pubkey,
-    pub vault_bump:          u8,
 }
 
 #[account]
@@ -1671,7 +1267,6 @@ pub struct VoteRecord {
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, PartialEq, Eq, Debug, InitSpace)]
 pub enum ProposalType {
     SystemChange,
-    AllocationRelease,
     OracleUpdate,
     InfrastructureDeployment,
     TreasurySpend,          // Authorize spending community treasury funds (post-milestone only)
@@ -1695,26 +1290,12 @@ pub enum EarthError {
     NotInitialized,
     #[msg("Wrong proposal type for this operation.")]
     WrongProposalType,
-    #[msg("Birth event already processed.")]
-    BirthEventAlreadyProcessed,
     #[msg("Arithmetic overflow.")]
     ArithmeticOverflow,
-    #[msg("Vault not initialized.")]
-    VaultNotInitialized,
-    #[msg("Vault already claimed.")]
-    VaultAlreadyClaimed,
-    #[msg("Unauthorized beneficiary.")]
-    UnauthorizedBeneficiary,
-    #[msg("Vault is time-locked until beneficiary turns 18.")]
-    VaultTimeLocked,
     #[msg("Invalid mint account.")]
     InvalidMint,
-    #[msg("Invalid vault token account.")]
-    InvalidVaultTokenAccount,
     #[msg("Invalid treasury account.")]
     InvalidTreasuryAccount,
-    #[msg("Invalid humanity reserve account.")]
-    InvalidHumanityReserveAccount,
     #[msg("Invalid inflation pool account.")]
     InvalidInflationPoolAccount,
     #[msg("Human already registered.")]
@@ -1773,12 +1354,10 @@ pub enum EarthError {
     NotRegistered,
     #[msg("Human is not active.")]
     HumanNotActive,
-    #[msg("Human is deceased.")]
-    HumanDeceased,
-    #[msg("Heir is not a verified human.")]
-    HeirNotHuman,
-    #[msg("Heir wallet mismatch.")]
-    HeirWalletMismatch,
+    #[msg("Allocation already claimed.")]
+    AllocationAlreadyClaimed,
+    #[msg("Wallet balance would exceed the 100 million EARTH cap.")]
+    WalletCapExceeded,
     #[msg("Inflation share already claimed for this epoch.")]
     InflationAlreadyClaimed,
     #[msg("Milestone 1 (100M humans) has not been reached yet.")]
