@@ -156,16 +156,6 @@ pub mod earth {
         Ok(())
     }
 
-    /// Allows the primary admin to update the backup wallet at any time.
-    pub fn update_backup_authority(
-        ctx: Context<AdminOnly>,
-        new_backup: Pubkey,
-    ) -> Result<()> {
-        ctx.accounts.program_state.backup_authority = new_backup;
-        msg!("Backup authority updated to: {}", new_backup);
-        Ok(())
-    }
-
     // ========================================================================
     // ANNUAL REVALUATION — ONCE PER YEAR, ADMIN SUBMITS, GOVERNANCE CAN REJECT
     // ========================================================================
