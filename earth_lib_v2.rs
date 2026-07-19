@@ -13,6 +13,29 @@ declare_id!("EARTH111111111111111111111111111111111111111");
 /// Cannot: mint tokens, move funds, alter supply outside programmatic rules.
 pub const ADMIN_AUTHORITY: Pubkey = solana_program::pubkey!("FndrmgjS9iZ7wgnj58fp49W3cMSc3XEfBYkYA8J4cTH3");
 
+// ============================================================================
+// OWNERSHIP RULES — ENFORCED AT EVERY GATE
+// ============================================================================
+//
+// EARTH tokens can only be owned, held, claimed, or transferred by verified
+// biological humans — individuals who have passed World ID iris verification.
+//
+// AI systems, bots, corporations, DAOs, smart contracts, and any non-human
+// entity are explicitly prohibited from holding or acquiring EARTH tokens.
+//
+// Enforcement layers:
+//   1. Registration: requires a valid World ID iris hash — physically impossible
+//      for a non-human to obtain. One iris = one registration. Forever.
+//   2. Transfer: transfer_with_human_check verifies BOTH sender and recipient
+//      are registered humans before any transfer is allowed.
+//   3. Claims: claim_vault and claim_inflation_share both require the claimer
+//      to be an active, non-deceased registered human.
+//   4. Oracle: the World ID oracle server must verify iris uniqueness and
+//      humanity before signing any register_human or mint instruction.
+//
+// These rules cannot be bypassed by governance vote. They are the foundation.
+// ============================================================================
+
 /// Starting token allocation per verified human (66,000 EARTH, 6 decimals).
 /// This is the GENESIS amount. Each year it grows with Earth's value.
 /// Read state.current_allocation for the live amount — never hardcode this.
@@ -48,6 +71,18 @@ pub const VOTING_PERIOD: i64 = 604_800;
 /// Challenge window for annual revaluation: 30 days.
 /// Governance can reject a submitted revaluation within this window.
 pub const REVALUATION_CHALLENGE_WINDOW: i64 = 2_592_000;
+
+// ---- Treasury Milestone Thresholds ----
+/// Milestone 1: 100 million verified humans.
+/// Unlocks 50% of the community treasury — distributed equally to all humans
+/// who were registered at the time the milestone was confirmed.
+/// Treasury is LOCKED for spending until this milestone is hit.
+pub const MILESTONE_1_THRESHOLD: u64 = 100_000_000;
+
+/// Milestone 2: 500 million verified humans.
+/// Unlocks the remaining treasury balance — distributed equally to all verified humans
+/// registered at the time of confirmation. After this, treasury rebuilds again.
+pub const MILESTONE_2_THRESHOLD: u64 = 500_000_000;
 
 // ============================================================================
 // PROGRAM
@@ -105,6 +140,16 @@ pub mod earth {
         state.estimated_world_population    = 0; // Set via first annual revaluation
         state.revaluation_epoch             = 0;
         state.last_revaluation_time         = 0; // No revaluation yet at genesis
+
+        // Milestone unlock tracking — treasury locked until milestones are hit
+        state.milestone_1_reached                  = false;
+        state.milestone_2_reached                  = false;
+        state.milestone_1_distribution_per_human   = 0;
+        state.milestone_2_distribution_per_human   = 0;
+        state.milestone_1_humans_snapshot          = 0;
+        state.milestone_2_humans_snapshot          = 0;
+        state.milestone_1_confirmed_at             = 0;
+        state.milestone_2_confirmed_at             = 0;
 
         msg!("EARTH initialized. Backup admin: {}", backup_authority);
         msg!("Genesis allocation: {} EARTH per human.", GENESIS_ALLOCATION);
@@ -240,6 +285,15 @@ pub mod earth {
     // ========================================================================
 
     /// Registers a verified human identity on-chain via the authorized oracle.
+    ///
+    /// WHO CAN REGISTER: biological humans only — any person who can physically
+    /// present their iris to the World ID scanner. AI systems, bots, programs,
+    /// corporations, and non-human entities cannot register. The iris hash is
+    /// unique to each person and cannot be reused — one human, one registration.
+    ///
+    /// The oracle is responsible for ensuring the iris scan is genuine before
+    /// signing this instruction. Once registered, this wallet is permanently
+    /// marked as a human identity in the EARTH system.
     pub fn register_human(
         ctx: Context<RegisterHuman>,
         iris_hash: [u8; 32],
@@ -267,6 +321,9 @@ pub mod earth {
         human.last_inflation_epoch_claimed = 0;
         // Record allocation at registration — used for vault top-up calculations
         human.allocation_at_registration = ctx.accounts.program_state.current_allocation;
+        // Milestone claim tracking
+        human.milestone_1_claimed = false;
+        human.milestone_2_claimed = false;
 
         let state = &mut ctx.accounts.program_state;
         state.total_verified_humans = state.total_verified_humans
@@ -679,31 +736,125 @@ pub mod earth {
     // TREASURY SPEND — GOVERNANCE GATED
     // ========================================================================
 
-    /// Executes a community treasury spend after governance has approved it.
-    ///
-    /// The community treasury belongs to all of humanity. To spend it, a
-    /// TreasurySpend proposal must pass governance vote (51% quorum).
-    /// This is how the community funds real things: infrastructure, outreach,
-    /// oracle servers, development — whatever the community decides.
-    ///
-    /// Only executable once per passed proposal (is_executed prevents replay).
-    pub fn execute_treasury_spend(
-        ctx: Context<ExecuteTreasurySpend>,
-        amount: u64,
-    ) -> Result<()> {
-        require!(!ctx.accounts.program_state.emergency_freeze, EarthError::SystemFrozen);
+    // ========================================================================
+    // TREASURY MILESTONE UNLOCKS — LOCKED UNTIL HUMANITY REACHES SCALE
+    // ========================================================================
 
-        let proposal = &ctx.accounts.spend_proposal;
+    /// Confirms Milestone 1: 100 million verified humans.
+    ///
+    /// Requires: admin signature + passed ConfirmMilestone1 governance proposal.
+    /// Effect: locks in the per-human distribution amount (50% of treasury / total humans).
+    /// After this, every human registered before this moment can claim their share.
+    /// Treasury remains locked for free spending — only milestone distributions allowed.
+    pub fn confirm_milestone_1(ctx: Context<ConfirmMilestone>) -> Result<()> {
+        let state = &ctx.accounts.program_state;
+        require!(!state.emergency_freeze, EarthError::SystemFrozen);
+        require!(!state.milestone_1_reached, EarthError::Milestone1AlreadyConfirmed);
+        require!(
+            state.total_verified_humans >= MILESTONE_1_THRESHOLD,
+            EarthError::Milestone1NotReached
+        );
+
+        let proposal = &ctx.accounts.milestone_proposal;
         require!(proposal.is_executed, EarthError::SpendProposalNotExecuted);
         require!(proposal.is_passed, EarthError::SpendProposalNotPassed);
         require!(
-            proposal.proposal_type == ProposalType::TreasurySpend,
+            proposal.proposal_type == ProposalType::ConfirmMilestone1,
             EarthError::WrongProposalType
         );
 
-        // Amount must match what was proposed (amount stored in proposal via description_hash
-        // is an off-chain commitment — the on-chain check is that this proposal passed)
-        require!(amount > 0, EarthError::SpendAmountZero);
+        // 50% of current treasury balance divided equally among all registered humans
+        let treasury_balance = ctx.accounts.treasury_token_account.amount;
+        let half = treasury_balance.checked_div(2).ok_or(EarthError::ArithmeticOverflow)?;
+        let total_humans = state.total_verified_humans;
+        require!(total_humans > 0, EarthError::NoEligibleVoters);
+
+        let per_human = half.checked_div(total_humans).ok_or(EarthError::ArithmeticOverflow)?;
+        require!(per_human > 0, EarthError::MilestoneShareZero);
+
+        let clock = Clock::get()?;
+        let state = &mut ctx.accounts.program_state;
+        state.milestone_1_reached                = true;
+        state.milestone_1_distribution_per_human = per_human;
+        state.milestone_1_humans_snapshot        = total_humans;
+        state.milestone_1_confirmed_at           = clock.unix_timestamp;
+
+        msg!("MILESTONE 1 CONFIRMED: {} million humans. {} EARTH per person (50% of treasury).",
+            total_humans / 1_000_000, per_human);
+        Ok(())
+    }
+
+    /// Confirms Milestone 2: 500 million verified humans.
+    ///
+    /// Requires: milestone 1 already confirmed + admin + passed ConfirmMilestone2 proposal.
+    /// Effect: distributes whatever remains in the treasury equally to all registered humans
+    /// at this moment. After both milestones, treasury keeps rebuilding from new claims
+    /// and annual inflation.
+    pub fn confirm_milestone_2(ctx: Context<ConfirmMilestone>) -> Result<()> {
+        let state = &ctx.accounts.program_state;
+        require!(!state.emergency_freeze, EarthError::SystemFrozen);
+        require!(state.milestone_1_reached, EarthError::Milestone1NotConfirmedYet);
+        require!(!state.milestone_2_reached, EarthError::Milestone2AlreadyConfirmed);
+        require!(
+            state.total_verified_humans >= MILESTONE_2_THRESHOLD,
+            EarthError::Milestone2NotReached
+        );
+
+        let proposal = &ctx.accounts.milestone_proposal;
+        require!(proposal.is_executed, EarthError::SpendProposalNotExecuted);
+        require!(proposal.is_passed, EarthError::SpendProposalNotPassed);
+        require!(
+            proposal.proposal_type == ProposalType::ConfirmMilestone2,
+            EarthError::WrongProposalType
+        );
+
+        // All remaining treasury balance divided equally among all registered humans
+        let treasury_balance = ctx.accounts.treasury_token_account.amount;
+        let total_humans = state.total_verified_humans;
+        require!(total_humans > 0, EarthError::NoEligibleVoters);
+
+        let per_human = treasury_balance.checked_div(total_humans).ok_or(EarthError::ArithmeticOverflow)?;
+        require!(per_human > 0, EarthError::MilestoneShareZero);
+
+        let clock = Clock::get()?;
+        let state = &mut ctx.accounts.program_state;
+        state.milestone_2_reached                = true;
+        state.milestone_2_distribution_per_human = per_human;
+        state.milestone_2_humans_snapshot        = total_humans;
+        state.milestone_2_confirmed_at           = clock.unix_timestamp;
+
+        msg!("MILESTONE 2 CONFIRMED: {} million humans. {} EARTH per person (remaining treasury).",
+            total_humans / 1_000_000, per_human);
+        Ok(())
+    }
+
+    /// Claim your share of the Milestone 1 distribution.
+    ///
+    /// Eligible: any registered human who was registered BEFORE the milestone
+    /// was confirmed. Each person receives milestone_1_distribution_per_human EARTH
+    /// transferred from the community treasury. Can only be claimed once.
+    pub fn claim_milestone_1_share(ctx: Context<ClaimMilestoneShare>) -> Result<()> {
+        require!(!ctx.accounts.program_state.emergency_freeze, EarthError::SystemFrozen);
+
+        let state = &ctx.accounts.program_state;
+        require!(state.milestone_1_reached, EarthError::Milestone1NotReached);
+
+        let human = &mut ctx.accounts.human_registry;
+        require!(human.is_registered, EarthError::NotRegistered);
+        require!(human.is_active, EarthError::HumanNotActive);
+        require!(!human.is_deceased, EarthError::HumanDeceased);
+        require!(!human.milestone_1_claimed, EarthError::Milestone1ShareAlreadyClaimed);
+
+        // Only humans registered before the milestone was confirmed are eligible
+        require!(
+            human.registration_timestamp <= state.milestone_1_confirmed_at,
+            EarthError::RegisteredAfterMilestone
+        );
+
+        let share = state.milestone_1_distribution_per_human;
+        require!(share > 0, EarthError::MilestoneShareZero);
+
+        human.milestone_1_claimed = true;
 
         let signer_seeds: &[&[&[u8]]] = &[&[TREASURY_SEED, &[ctx.bumps.treasury_token_account]]];
 
@@ -712,16 +863,61 @@ pub mod earth {
                 ctx.accounts.token_program.to_account_info(),
                 Transfer {
                     from:      ctx.accounts.treasury_token_account.to_account_info(),
-                    to:        ctx.accounts.destination_token_account.to_account_info(),
+                    to:        ctx.accounts.human_token_account.to_account_info(),
                     authority: ctx.accounts.treasury_token_account.to_account_info(),
                 },
                 signer_seeds,
             ),
-            amount,
+            share,
         )?;
 
-        msg!("Treasury spend executed: {} EARTH to {}",
-            amount, ctx.accounts.destination_token_account.key());
+        msg!("Milestone 1 share claimed: {} EARTH to {}", share, ctx.accounts.human.key());
+        Ok(())
+    }
+
+    /// Claim your share of the Milestone 2 distribution.
+    ///
+    /// Same pattern as milestone 1 — eligible humans registered before confirmation
+    /// each receive milestone_2_distribution_per_human from the treasury.
+    pub fn claim_milestone_2_share(ctx: Context<ClaimMilestoneShare>) -> Result<()> {
+        require!(!ctx.accounts.program_state.emergency_freeze, EarthError::SystemFrozen);
+
+        let state = &ctx.accounts.program_state;
+        require!(state.milestone_2_reached, EarthError::Milestone2NotReached);
+
+        let human = &mut ctx.accounts.human_registry;
+        require!(human.is_registered, EarthError::NotRegistered);
+        require!(human.is_active, EarthError::HumanNotActive);
+        require!(!human.is_deceased, EarthError::HumanDeceased);
+        require!(!human.milestone_2_claimed, EarthError::Milestone2ShareAlreadyClaimed);
+
+        // Only humans registered before the milestone was confirmed are eligible
+        require!(
+            human.registration_timestamp <= state.milestone_2_confirmed_at,
+            EarthError::RegisteredAfterMilestone
+        );
+
+        let share = state.milestone_2_distribution_per_human;
+        require!(share > 0, EarthError::MilestoneShareZero);
+
+        human.milestone_2_claimed = true;
+
+        let signer_seeds: &[&[&[u8]]] = &[&[TREASURY_SEED, &[ctx.bumps.treasury_token_account]]];
+
+        token_2022::transfer(
+            CpiContext::new_with_signer(
+                ctx.accounts.token_program.to_account_info(),
+                Transfer {
+                    from:      ctx.accounts.treasury_token_account.to_account_info(),
+                    to:        ctx.accounts.human_token_account.to_account_info(),
+                    authority: ctx.accounts.treasury_token_account.to_account_info(),
+                },
+                signer_seeds,
+            ),
+            share,
+        )?;
+
+        msg!("Milestone 2 share claimed: {} EARTH to {}", share, ctx.accounts.human.key());
         Ok(())
     }
 
@@ -1381,6 +1577,65 @@ pub struct FinalizeProposal<'info> {
     pub program_state: Account<'info, ProgramState>,
 }
 
+/// Used by both confirm_milestone_1 and confirm_milestone_2.
+/// Admin submits with a passed governance proposal; treasury balance is read to calculate per-human amount.
+#[derive(Accounts)]
+pub struct ConfirmMilestone<'info> {
+    #[account(mut)]
+    pub admin: Signer<'info>,
+
+    /// The governance proposal authorizing this milestone confirmation.
+    pub milestone_proposal: Account<'info, Proposal>,
+
+    /// Treasury account — balance read to calculate per-human distribution.
+    #[account(
+        seeds = [TREASURY_SEED],
+        bump,
+        constraint = treasury_token_account.key() == program_state.treasury_token_account @ EarthError::InvalidTreasuryAccount,
+    )]
+    pub treasury_token_account: InterfaceAccount<'info, TokenAccount>,
+
+    #[account(
+        mut,
+        seeds = [PROGRAM_STATE_SEED],
+        bump,
+        constraint = program_state.is_initialized @ EarthError::NotInitialized,
+        constraint = is_admin(&admin.key(), &program_state) @ EarthError::UnauthorizedAdmin,
+    )]
+    pub program_state: Account<'info, ProgramState>,
+}
+
+/// Used by both claim_milestone_1_share and claim_milestone_2_share.
+#[derive(Accounts)]
+pub struct ClaimMilestoneShare<'info> {
+    #[account(mut)]
+    pub human: Signer<'info>,
+
+    #[account(
+        mut,
+        seeds = [HUMAN_REGISTRY_SEED, human.key().as_ref()],
+        bump,
+        constraint = human_registry.wallet == human.key() @ EarthError::SenderWalletMismatch,
+    )]
+    pub human_registry: Account<'info, HumanRegistry>,
+
+    #[account(
+        mut,
+        seeds = [TREASURY_SEED],
+        bump,
+        constraint = treasury_token_account.key() == program_state.treasury_token_account @ EarthError::InvalidTreasuryAccount,
+    )]
+    pub treasury_token_account: InterfaceAccount<'info, TokenAccount>,
+
+    #[account(mut)]
+    pub human_token_account: InterfaceAccount<'info, TokenAccount>,
+
+    #[account(seeds = [PROGRAM_STATE_SEED], bump, constraint = program_state.is_initialized @ EarthError::NotInitialized)]
+    pub program_state: Account<'info, ProgramState>,
+
+    pub token_program: Program<'info, Token2022>,
+}
+
 #[derive(Accounts)]
 pub struct EmergencyAction<'info> {
     #[account(mut)]
@@ -1462,6 +1717,33 @@ pub struct ProgramState {
 
     /// Increments each year. Tracks revaluation history.
     pub revaluation_epoch:              u64,
+
+    // ---- Milestone Treasury Unlock Tracking ----
+    /// Whether the 100 million human milestone has been confirmed.
+    /// Treasury is LOCKED for spending until this is true.
+    pub milestone_1_reached:                  bool,
+
+    /// Whether the 500 million human milestone has been confirmed.
+    pub milestone_2_reached:                  bool,
+
+    /// Per-human EARTH amount locked in at milestone 1 confirmation (50% of treasury / humans).
+    pub milestone_1_distribution_per_human:   u64,
+
+    /// Per-human EARTH amount locked in at milestone 2 confirmation (remaining treasury / humans).
+    pub milestone_2_distribution_per_human:   u64,
+
+    /// Total verified humans at the time milestone 1 was confirmed.
+    pub milestone_1_humans_snapshot:          u64,
+
+    /// Total verified humans at the time milestone 2 was confirmed.
+    pub milestone_2_humans_snapshot:          u64,
+
+    /// Unix timestamp when milestone 1 was confirmed.
+    /// Humans registered AFTER this timestamp are not eligible for the milestone 1 distribution.
+    pub milestone_1_confirmed_at:             i64,
+
+    /// Unix timestamp when milestone 2 was confirmed.
+    pub milestone_2_confirmed_at:             i64,
 }
 
 #[account]
@@ -1478,6 +1760,12 @@ pub struct HumanRegistry {
     pub last_inflation_epoch_claimed: u64,
     /// Allocation amount at time of registration — useful for top-up calculations
     pub allocation_at_registration:   u64,
+
+    /// Whether this human has claimed their Milestone 1 (100M) treasury distribution.
+    pub milestone_1_claimed:          bool,
+
+    /// Whether this human has claimed their Milestone 2 (500M) treasury distribution.
+    pub milestone_2_claimed:          bool,
 }
 
 #[account]
@@ -1534,9 +1822,11 @@ pub enum ProposalType {
     EmergencyFreeze,
     UnfreezeSystem,
     InfrastructureDeployment,
-    TreasurySpend,          // Authorize spending community treasury funds
+    TreasurySpend,          // Authorize spending community treasury funds (post-milestone only)
     AnnualRevaluation,      // Challenge or ratify the submitted annual revaluation
     UpdateInflationRate,    // Adjust the inflation/growth rate
+    ConfirmMilestone1,      // Governance vote to unlock treasury at 100 million humans
+    ConfirmMilestone2,      // Governance vote to unlock treasury at 500 million humans
 }
 
 // ============================================================================
@@ -1653,4 +1943,24 @@ pub enum EarthError {
     HeirWalletMismatch,
     #[msg("Inflation share already claimed for this epoch.")]
     InflationAlreadyClaimed,
+    #[msg("Milestone 1 (100M humans) has not been reached yet.")]
+    Milestone1NotReached,
+    #[msg("Milestone 2 (500M humans) has not been reached yet.")]
+    Milestone2NotReached,
+    #[msg("Milestone 1 has already been confirmed.")]
+    Milestone1AlreadyConfirmed,
+    #[msg("Milestone 2 has already been confirmed.")]
+    Milestone2AlreadyConfirmed,
+    #[msg("Milestone 1 must be confirmed before Milestone 2.")]
+    Milestone1NotConfirmedYet,
+    #[msg("Milestone 1 share already claimed.")]
+    Milestone1ShareAlreadyClaimed,
+    #[msg("Milestone 2 share already claimed.")]
+    Milestone2ShareAlreadyClaimed,
+    #[msg("Milestone distribution share is zero — treasury may be empty.")]
+    MilestoneShareZero,
+    #[msg("You registered after the milestone was confirmed and are not eligible for this distribution.")]
+    RegisteredAfterMilestone,
+    #[msg("Community treasury is locked until Milestone 1 (100M humans) is confirmed.")]
+    TreasuryLockedUntilMilestone,
 }
