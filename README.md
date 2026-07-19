@@ -20,7 +20,6 @@ Every verified human on Earth gets an equal share of Earth's total value.
 | Instruction | Who | What |
 |---|---|---|
 | `initialize_mint` | Admin (once) | Creates the mint, treasury, inflation pool, and program state |
-| `update_backup_authority` | Admin | Updates the backup admin wallet |
 | `update_oracle` | Admin | Updates the World ID oracle signing key |
 
 ### Human Registration & Claiming
