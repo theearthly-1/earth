@@ -122,9 +122,6 @@ pub mod earth {
         state.total_verified_humans         = 0;
         state.total_proposals               = 0;
         state.is_initialized                = true;
-        state.emergency_freeze              = false;
-        state.freeze_reason                 = [0u8; 64];
-        state.freeze_timestamp              = 0;
         state.last_inflation_time           = Clock::get()?.unix_timestamp;
         state.inflation_epoch               = 0;
         state.last_inflation_per_human      = 0;
@@ -204,7 +201,6 @@ pub mod earth {
         estimated_world_population: u64,
         estimated_new_verifiers_this_year: u64,
     ) -> Result<()> {
-        require!(!ctx.accounts.program_state.emergency_freeze, EarthError::SystemFrozen);
 
         let state    = &ctx.accounts.program_state;
         let clock    = Clock::get()?;
@@ -302,7 +298,6 @@ pub mod earth {
         iris_hash: [u8; 32],
     ) -> Result<()> {
         let state = &ctx.accounts.program_state;
-        require!(!state.emergency_freeze, EarthError::SystemFrozen);
         require!(state.oracle_data_account != Pubkey::default(), EarthError::OracleNotSet);
         require_keys_eq!(
             ctx.accounts.oracle_signer.key(),
@@ -347,7 +342,6 @@ pub mod earth {
         ctx: Context<SetHeir>,
         heir_wallet: Pubkey,
     ) -> Result<()> {
-        require!(!ctx.accounts.program_state.emergency_freeze, EarthError::SystemFrozen);
 
         let human = &mut ctx.accounts.human_registry;
         require!(human.is_registered, EarthError::NotRegistered);
@@ -382,7 +376,6 @@ pub mod earth {
         _birth_event_id: [u8; 32],
     ) -> Result<()> {
         let state = &ctx.accounts.program_state;
-        require!(!state.emergency_freeze, EarthError::SystemFrozen);
         require_keys_eq!(
             ctx.accounts.oracle_signer.key(),
             state.oracle_data_account,
@@ -456,7 +449,6 @@ pub mod earth {
         birth_timestamp: i64,
     ) -> Result<()> {
         let state = &ctx.accounts.program_state;
-        require!(!state.emergency_freeze, EarthError::SystemFrozen);
         require!(state.oracle_data_account != Pubkey::default(), EarthError::OracleNotSet);
         require_keys_eq!(
             ctx.accounts.oracle_signer.key(),
@@ -539,7 +531,6 @@ pub mod earth {
     /// In practice it tracks Earth's value growth (~3-4%), reviewed each year.
     /// Permissionless — anyone can trigger it after 365 days have elapsed.
     pub fn mint_annual_inflation(ctx: Context<MintAnnualInflation>) -> Result<()> {
-        require!(!ctx.accounts.program_state.emergency_freeze, EarthError::SystemFrozen);
 
         let state = &ctx.accounts.program_state;
         let clock = Clock::get()?;
@@ -614,7 +605,6 @@ pub mod earth {
     /// Each active verified human claims their equal share of the annual inflation pool.
     /// Can only be called once per inflation epoch per human.
     pub fn claim_inflation_share(ctx: Context<ClaimInflationShare>) -> Result<()> {
-        require!(!ctx.accounts.program_state.emergency_freeze, EarthError::SystemFrozen);
 
         let state = &ctx.accounts.program_state;
         require!(state.inflation_epoch > 0, EarthError::InflationAmountZero);
@@ -658,7 +648,6 @@ pub mod earth {
 
     /// Verified human claims their EARTH allocation from their personal vault.
     pub fn claim_vault(ctx: Context<ClaimVault>) -> Result<()> {
-        require!(!ctx.accounts.program_state.emergency_freeze, EarthError::SystemFrozen);
 
         let vault = &mut ctx.accounts.vault_state;
         require!(vault.is_initialized, EarthError::VaultNotInitialized);
@@ -728,7 +717,6 @@ pub mod earth {
     /// Treasury remains locked for free spending — only milestone distributions allowed.
     pub fn confirm_milestone_1(ctx: Context<ConfirmMilestone>) -> Result<()> {
         let state = &ctx.accounts.program_state;
-        require!(!state.emergency_freeze, EarthError::SystemFrozen);
         require!(!state.milestone_1_reached, EarthError::Milestone1AlreadyConfirmed);
         require!(
             state.total_verified_humans >= MILESTONE_1_THRESHOLD,
@@ -772,7 +760,6 @@ pub mod earth {
     /// and annual inflation.
     pub fn confirm_milestone_2(ctx: Context<ConfirmMilestone>) -> Result<()> {
         let state = &ctx.accounts.program_state;
-        require!(!state.emergency_freeze, EarthError::SystemFrozen);
         require!(state.milestone_1_reached, EarthError::Milestone1NotConfirmedYet);
         require!(!state.milestone_2_reached, EarthError::Milestone2AlreadyConfirmed);
         require!(
@@ -814,7 +801,6 @@ pub mod earth {
     /// was confirmed. Each person receives milestone_1_distribution_per_human EARTH
     /// transferred from the community treasury. Can only be claimed once.
     pub fn claim_milestone_1_share(ctx: Context<ClaimMilestoneShare>) -> Result<()> {
-        require!(!ctx.accounts.program_state.emergency_freeze, EarthError::SystemFrozen);
 
         let state = &ctx.accounts.program_state;
         require!(state.milestone_1_reached, EarthError::Milestone1NotReached);
@@ -860,7 +846,6 @@ pub mod earth {
     /// Same pattern as milestone 1 — eligible humans registered before confirmation
     /// each receive milestone_2_distribution_per_human from the treasury.
     pub fn claim_milestone_2_share(ctx: Context<ClaimMilestoneShare>) -> Result<()> {
-        require!(!ctx.accounts.program_state.emergency_freeze, EarthError::SystemFrozen);
 
         let state = &ctx.accounts.program_state;
         require!(state.milestone_2_reached, EarthError::Milestone2NotReached);
@@ -912,7 +897,6 @@ pub mod earth {
         description_hash: [u8; 32],
     ) -> Result<()> {
         let state = &ctx.accounts.program_state;
-        require!(!state.emergency_freeze, EarthError::SystemFrozen);
         require!(ctx.accounts.proposer_human_registry.is_registered, EarthError::ProposerNotHuman);
         require!(ctx.accounts.proposer_human_registry.is_active, EarthError::ProposerNotActive);
 
@@ -941,7 +925,6 @@ pub mod earth {
     }
 
     pub fn cast_vote(ctx: Context<CastVote>, vote_choice: bool) -> Result<()> {
-        require!(!ctx.accounts.program_state.emergency_freeze, EarthError::SystemFrozen);
         require!(ctx.accounts.voter_human_registry.is_registered, EarthError::VoterNotHuman);
         require!(ctx.accounts.voter_human_registry.is_active, EarthError::VoterNotActive);
         require!(!ctx.accounts.voter_human_registry.is_deceased, EarthError::HumanDeceased);
@@ -977,7 +960,6 @@ pub mod earth {
     }
 
     pub fn finalize_proposal(ctx: Context<FinalizeProposal>) -> Result<()> {
-        require!(!ctx.accounts.program_state.emergency_freeze, EarthError::SystemFrozen);
 
         let proposal = &mut ctx.accounts.proposal;
         require!(proposal.is_active, EarthError::ProposalNotActive);
@@ -1003,48 +985,12 @@ pub mod earth {
         Ok(())
     }
 
-    // ========================================================================
-    // EMERGENCY KILL SWITCH — NO TIME DELAY
-    // ========================================================================
-
-    /// Freezes all contract operations immediately.
-    /// Can be triggered by primary OR backup admin.
-    pub fn emergency_freeze(ctx: Context<EmergencyAction>, reason: [u8; 64]) -> Result<()> {
-        let state = &mut ctx.accounts.program_state;
-        state.emergency_freeze = true;
-        state.freeze_reason    = reason;
-        state.freeze_timestamp = Clock::get()?.unix_timestamp;
-        msg!("EMERGENCY FREEZE ACTIVATED.");
-        Ok(())
-    }
-
-    /// Lifts the emergency freeze.
-    /// Requires: admin or backup admin signature + a passed governance vote.
-    /// No time delay — governance vote is the only gate.
-    pub fn emergency_unfreeze(ctx: Context<EmergencyUnfreeze>) -> Result<()> {
-        let state = &ctx.accounts.program_state;
-        require!(state.emergency_freeze, EarthError::SystemNotFrozen);
-        require!(ctx.accounts.unfreeze_proposal.is_executed, EarthError::UnfreezeProposalNotExecuted);
-        require!(ctx.accounts.unfreeze_proposal.is_passed, EarthError::UnfreezeProposalNotPassed);
-        require!(
-            ctx.accounts.unfreeze_proposal.proposal_type == ProposalType::UnfreezeSystem,
-            EarthError::WrongProposalType
-        );
-
-        let state = &mut ctx.accounts.program_state;
-        state.emergency_freeze = false;
-        state.freeze_reason    = [0u8; 64];
-        state.freeze_timestamp = 0;
-        msg!("System unfrozen after governance approval.");
-        Ok(())
-    }
 
     // ========================================================================
     // ORACLE UPDATE
     // ========================================================================
 
     pub fn update_oracle(ctx: Context<AdminOnly>, new_oracle: Pubkey) -> Result<()> {
-        require!(!ctx.accounts.program_state.emergency_freeze, EarthError::SystemFrozen);
         ctx.accounts.program_state.oracle_data_account = new_oracle;
         msg!("Oracle updated to: {}", new_oracle);
         Ok(())
@@ -1578,37 +1524,6 @@ pub struct ClaimMilestoneShare<'info> {
     pub token_program: Program<'info, Token2022>,
 }
 
-#[derive(Accounts)]
-pub struct EmergencyAction<'info> {
-    #[account(mut)]
-    pub admin: Signer<'info>,
-
-    #[account(
-        mut,
-        seeds = [PROGRAM_STATE_SEED],
-        bump,
-        constraint = program_state.is_initialized @ EarthError::NotInitialized,
-        constraint = is_admin(&admin.key(), &program_state) @ EarthError::UnauthorizedAdmin,
-    )]
-    pub program_state: Account<'info, ProgramState>,
-}
-
-#[derive(Accounts)]
-pub struct EmergencyUnfreeze<'info> {
-    #[account(mut)]
-    pub admin: Signer<'info>,
-
-    #[account(
-        mut,
-        seeds = [PROGRAM_STATE_SEED],
-        bump,
-        constraint = program_state.is_initialized @ EarthError::NotInitialized,
-        constraint = is_admin(&admin.key(), &program_state) @ EarthError::UnauthorizedAdmin,
-    )]
-    pub program_state: Account<'info, ProgramState>,
-
-    pub unfreeze_proposal: Account<'info, Proposal>,
-}
 
 // ============================================================================
 // STATE ACCOUNTS
@@ -1630,9 +1545,6 @@ pub struct ProgramState {
     pub total_verified_humans:          u64,
     pub total_proposals:                u64,
     pub is_initialized:                 bool,
-    pub emergency_freeze:               bool,
-    pub freeze_reason:                  [u8; 64],
-    pub freeze_timestamp:               i64,
     pub last_inflation_time:            i64,
     pub inflation_epoch:                u64,
     pub last_inflation_per_human:       u64,
@@ -1761,8 +1673,6 @@ pub enum ProposalType {
     SystemChange,
     AllocationRelease,
     OracleUpdate,
-    EmergencyFreeze,
-    UnfreezeSystem,
     InfrastructureDeployment,
     TreasurySpend,          // Authorize spending community treasury funds (post-milestone only)
     AnnualRevaluation,      // Challenge or ratify the submitted annual revaluation
@@ -1783,14 +1693,6 @@ pub enum EarthError {
     UnauthorizedOracle,
     #[msg("Program not initialized.")]
     NotInitialized,
-    #[msg("SYSTEM FROZEN: all operations halted.")]
-    SystemFrozen,
-    #[msg("System is not currently frozen.")]
-    SystemNotFrozen,
-    #[msg("Unfreeze proposal has not been executed.")]
-    UnfreezeProposalNotExecuted,
-    #[msg("Unfreeze proposal did not pass.")]
-    UnfreezeProposalNotPassed,
     #[msg("Wrong proposal type for this operation.")]
     WrongProposalType,
     #[msg("Birth event already processed.")]
