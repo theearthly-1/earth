@@ -19,7 +19,7 @@ Every verified human on Earth gets an equal share of Earth's total value.
 ### Setup
 | Instruction | Who | What |
 |---|---|---|
-| `initialize_mint` | Admin (once) | Creates the mint, treasury, inflation pool, and program state |
+| `initialize_mint` | Admin (once) | Creates the mint, treasury, inflation pool, and program state. Mints 1,000,000 EARTH to the founder wallet |
 | `update_oracle` | Admin | Updates the World ID oracle signing key |
 
 ### Human Registration & Claiming
@@ -40,9 +40,9 @@ The treasury is **locked** until humanity reaches scale. No one can spend it bef
 
 | Instruction | Who | What |
 |---|---|---|
-| `confirm_milestone_1` | Admin + governance vote | Confirms 100M verified humans reached. Locks in per-human distribution (50% of treasury ÷ total humans) |
+| `confirm_milestone_1` | Anyone | Permissionless. Contract checks `total_verified_humans ≥ 100M` itself. Locks in per-human distribution (50% of treasury ÷ total humans). Mints 1,000,000 EARTH to founder wallet |
 | `claim_milestone_1_share` | Eligible human | Claims their share of the milestone 1 distribution. Must have registered before milestone was confirmed |
-| `confirm_milestone_2` | Admin + governance vote | Confirms 500M verified humans reached. Distributes remaining treasury |
+| `confirm_milestone_2` | Anyone | Permissionless. Contract checks `total_verified_humans ≥ 500M` itself. Distributes remaining treasury. Mints 10,000,000 EARTH to founder wallet |
 | `claim_milestone_2_share` | Eligible human | Claims their share of the milestone 2 distribution |
 
 ### Governance
