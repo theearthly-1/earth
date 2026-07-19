@@ -58,11 +58,10 @@ The treasury is **locked** until humanity reaches scale. No one can spend it bef
 - `SystemChange` — general system changes
 - `OracleUpdate` — change the World ID oracle
 - `InfrastructureDeployment` — infrastructure decisions
-- `TreasurySpend` — (post-milestone only, via milestone instructions)
-- `AnnualRevaluation` — ratify or challenge the yearly allocation update
+- `AnnualRevaluation` — ratify or challenge the yearly annual revaluation
 - `UpdateInflationRate` — adjust the 3.5% inflation rate
-- `ConfirmMilestone1` — governance vote required to unlock treasury at 100M humans
-- `ConfirmMilestone2` — governance vote required to unlock treasury at 500M humans
+- `ConfirmMilestone1` — advisory vote only; milestones are confirmed permissionlessly by the contract itself
+- `ConfirmMilestone2` — advisory vote only; milestones are confirmed permissionlessly by the contract itself
 
 ---
 
@@ -81,7 +80,7 @@ The treasury is **locked** until humanity reaches scale. No one can spend it bef
 
 - **Genesis allocation:** 66,000 EARTH per verified human
 - **Growth:** ~3.5%/year — late joiners get more because Earth is worth more
-- **Supply:** only minted when a real human claims — no pre-mint
+- **Supply:** minted on demand — 1,000,000 EARTH founder allocation at launch, everything else minted only when a human claims
 - **Treasury:** receives equal amount to every human claim + 50% of annual inflation
 - **Inflation pool:** 50% of annual inflation, split equally among all registered humans
 
