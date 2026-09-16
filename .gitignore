@@ -1,0 +1,31 @@
+# Secrets — never commit these
+oracle-keypair.json
+*keypair*.json
+*.env
+*.env.*
+!miniapp/.env.local.example
+
+# Old Solana-era program and one-off debug scripts — not part of current
+# development, kept locally for reference, not tracked going forward.
+programs/
+scratch_*.sh
+scratch_*.js
+
+# Node / Next.js
+node_modules/
+.next/
+*.tsbuildinfo
+npm-debug.log*
+
+# Foundry
+cache/
+out/
+broadcast/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+
+# Editor backups and local tool config
+*.bak
+.claude/
